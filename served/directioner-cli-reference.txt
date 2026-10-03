@@ -1,0 +1,1111 @@
+================================================================================
+DIRECTIONER CLI — COMPLETE REFERENCE
+Everything this specific agent contains: commands, tools, agents, models, files
+================================================================================
+
+This is the reference for THIS codebase — the Directioner CLI as built from the
+monorepo in /workspace/project. Every command, tool, agent, and model below was
+read out of the source, not from documentation. Identifiers are given exactly as
+they appear in the code so you can grep for them.
+
+Directioner is the free-only variant of the Beyonders CLI. It is the same program,
+compiled with HOSTED_MODE=true, which dead-code-eliminates the paid features
+and removes the commands that only make sense on a paid plan. Source of that
+switch: cli/src/utils/constants.ts -> IS_HOSTED.
+
+Contents
+  1.  What it is
+  2.  Command-line arguments
+  3.  Slash commands (the full list)
+  4.  Implicit commands (no slash needed)
+  5.  Commands registered but not shown in the menu
+  6.  Removed versus Directioner-only commands
+  7.  Keyboard shortcuts and input modes
+  8.  The agent tool set (37 tools, one by one)
+  9.  Tool execution rules
+  10. Agent modes
+  11. The agent roster (110 agents)
+  12. The model catalog
+  13. Reasoning effort
+  14. BYOK (bring your own key)
+  15. Context files and skills
+  16. Trust, permissions, and secrets
+  17. On-disk layout
+  18. Sessions and history
+  19. Ads (how the free tier is funded)
+  20. Architecture and the build
+  21. Distribution and updates
+
+
+--------------------------------------------------------------------------------
+1. WHAT IT IS
+--------------------------------------------------------------------------------
+
+The Directioner CLI is a terminal coding agent: it runs in your shell, takes a
+natural-language request, edits files in your repository, runs commands to check
+its work, and iterates. Five surfaces share this codebase (CLI, Desktop, Web,
+Cloud, Chat); this document covers the CLI.
+
+Two facts worth internalizing before the lists:
+
+  - There are three separate "command" concepts in this codebase, and they are
+    NOT the same list:
+      a) CLI flags        — argv, parsed by cli/src/cli-args.ts
+      b) Slash commands   — what the menu shows, cli/src/data/slash-commands.ts
+      c) Command handlers — what can actually be dispatched,
+                            cli/src/commands/command-registry.ts
+    Some commands exist in (c) but not (b). This is a deliberate pattern, and
+    section 5 covers it.
+
+  - The mode you are in determines which agent root runs, and the agent root
+    determines which tools and subagents are available. Section 10.
+
+
+--------------------------------------------------------------------------------
+2. COMMAND-LINE ARGUMENTS
+--------------------------------------------------------------------------------
+
+Directioner deliberately ships a much smaller argv surface than Beyonders. Source:
+cli/src/cli-args.ts, the `isDirectioner` branch.
+
+  -v, --version
+      Print the CLI version and exit.
+
+  --continue [conversation-id]
+      Resume a previous conversation. With no id, continues the most recent
+      one. With an id, continues that specific conversation.
+
+  --cwd <directory>
+      Set the working directory. Defaults to the current directory. This is how
+      you point the agent at a different checkout without cd-ing first.
+
+  --trust-agents
+      Load this repository's .agents files and mcp.json without the interactive
+      trust prompt. Intended for CI. See section 16 for why the gate exists.
+
+  -h, --help
+      Show the help message.
+
+  login
+      The ONLY positional command accepted (enforced by an Argument choices
+      list of ['login']).
+
+What is deliberately ABSENT in Directioner, but present in Beyonders:
+
+  --agent <agent-id>     Run a specific agent id.
+  --clear-logs           Delete existing log files before starting.
+  --initial-prompt       Supply the first prompt on the command line.
+  --initial-mode         Start in a given mode.
+
+So in Directioner you cannot pick an agent or a mode from argv. Modes are reached
+with /model-free equivalents or by mode commands where available, and the agent
+root is chosen by your mode and your selected model.
+
+
+--------------------------------------------------------------------------------
+3. SLASH COMMANDS (THE FULL LIST)
+--------------------------------------------------------------------------------
+
+This is the complete Directioner slash menu, from cli/src/data/slash-commands.ts
+after the Directioner filter is applied. Format: command (aliases) — description.
+
+  /help  (h, ?)
+      Display keyboard shortcuts and tips. Opens the help banner.
+
+  /diagnostics  (diag, processes)
+      Show local CLI resource usage and terminal tool process IDs. Useful when a
+      command appears to be hung.
+
+  /interview
+      The AI asks a series of questions to flesh out your request into a spec.
+      Sends a prompt that requires at least three rounds of ask_user, then
+      writes a <name>-spec.md. Makes NO code changes.
+
+  /plan
+      Create a plan for how to implement a request. Gathers context then thinks
+      it through. Runs on your currently selected model. No gate.
+
+  /review
+      Review code changes. With no argument, opens a scope-selection screen
+      (changes in this conversation / uncommitted changes / this branch vs main
+      / custom). With an argument, reviews immediately on your selected model.
+
+  /queue  (queued)
+      Edit, reorder, or delete messages waiting to be sent. Note there is
+      deliberately no /q alias, because /q quits the CLI.
+
+  /new  (n, clear, c, reset)
+      Clear the conversation and start a new chat. Aborts any in-flight run
+      first. If you pass text, it is sent as the first message of the new chat.
+
+  /history  (chats)
+      Browse and resume past conversations.
+
+  /copy  (copy-chat)
+      Copy the full conversation (messages + tool results) to the clipboard.
+
+  /export  (export-chat)
+      Write the full conversation to a file — .md, or .json for raw messages.
+
+  /feedback  (bug, report)
+      Share feedback. With an argument, the form is pre-populated.
+
+  /bash  (!)
+      Enter bash mode, or with an argument run that shell command immediately.
+      Typing a leading "!" also enters bash mode.
+
+  /theme:toggle
+      Toggle between light and dark mode.
+
+  /byok  (provider)
+      Manage direct OpenRouter or OpenAI-compatible inference. See section 14.
+
+  /model
+      Choose the model for your next message. Opens the model picker.
+
+  /end-session
+      End your current session. Prints END_SESSION_MESSAGE and returns to the
+      Directioner landing screen. Your next message starts a new session; /model
+      changes the model.
+
+  /dashboard  (usage, stats, streak)
+      Open your usage, streak, and account dashboard in the browser. The aliases
+      exist because Directioner removes /usage, leaving "how much have I used?"
+      with no other answer in this build.
+
+  /logout  (signout)
+      Sign out of your session. Stops any active run first.
+
+  /exit  (quit, q)
+      Quit the CLI.
+
+  /skill:<name>
+      Dynamically generated from every installed skill. Invoking one sends the
+      skill's SKILL.md to the agent. Bare invocation drops into skill mode so
+      you can add instructions before it sends. See sections 15 and 7.
+
+Mode commands: NONE in Directioner. The /mode:<name> family is generated from
+AGENT_MODES and is excluded from this build (the mapping is empty when
+IS_HOSTED). On Beyonders these are /mode:default, /mode:lite, /mode:max,
+/mode:plan with /model:<name> aliases.
+
+
+--------------------------------------------------------------------------------
+4. IMPLICIT COMMANDS (NO SLASH NEEDED)
+--------------------------------------------------------------------------------
+
+Commands flagged implicitCommand: true can be typed bare when the input matches
+the id exactly with no arguments. In Directioner:
+
+  help      -> /help
+  new       -> /new
+  logout    -> /logout
+  exit      -> /exit
+
+(Beyonders also has `init` implicit; Directioner removes /init entirely.)
+
+Bare "exit" quits; bare "new" starts a fresh chat. Anything else without a
+leading slash is treated as a prompt to the agent.
+
+One more no-slash affordance: the help banner documents "?" as Help when the
+input is empty, in addition to the "h" and "?" aliases.
+
+
+--------------------------------------------------------------------------------
+5. COMMANDS REGISTERED BUT NOT SHOWN IN THE MENU
+--------------------------------------------------------------------------------
+
+cli/src/commands/command-registry.ts builds a dispatcher that is not identical
+to the slash menu. The clearest example is the sponsored-proposal family, which
+is dispatchable but absent from the menu:
+
+  /ads:proposal
+  /ads:dismiss-proposal
+  /ads:accept-proposal
+  /ads:undo
+  /ads:report-proposal
+  /ads:never-advertiser
+  /ads:proposals-off
+
+These control the sponsored-proposal channel (the advertising rail that funds
+free access). The source comments state the card itself binds NO bare keys, so
+these commands are the only way to reach its menu and its decline. They were
+deliberately moved off `m` and `esc`, which used to fire alongside whatever the
+user was typing, because the key handlers are global.
+
+Also dispatcher-only in the sense that the menu and the registry are different
+structures: /mode:<name> exists on Beyonders only, /dashboard exists on Directioner
+only, and the two filters are applied separately in each file.
+
+Practical consequence: if a command is in the registry but not the menu, typing
+it still works. The menu is a discovery aid, not the set of valid commands.
+
+
+--------------------------------------------------------------------------------
+6. REMOVED VERSUS DIRECTIONER-ONLY COMMANDS
+--------------------------------------------------------------------------------
+
+Useful because it tells you what the paid product has that this one does not,
+and vice versa. Two lists, one per layer.
+
+Removed from Directioner (cli/src/data/slash-commands.ts,
+DIRECTIONER_REMOVED_COMMAND_IDS):
+
+  /ads:enable      — contextual ads toggle
+  /ads:disable     — contextual ads toggle
+  /usage           — credits and subscription quota
+  /subscribe       — subscribe for more usage
+  /agent:gpt-5     — spawn the GPT-5 agent shortcut
+  /image  (/img, /attach)  — attach an image file
+  /publish         — publish agents to the agent store
+  /init            — create a starter knowledge.md
+
+The handler-layer list (DIRECTIONER_REMOVED_COMMANDS) is nearly the same:
+ads:enable, ads:disable, usage, subscribe, image, publish, gpt-5-agent.
+
+Directioner-only (DIRECTIONER_ONLY_COMMANDS, removed on Beyonders):
+
+  /byok          — direct provider inference
+  /plan          — planning on your selected model
+  /end-session   — Directioner session lifecycle
+  /model         — the Directioner model picker
+  /dashboard     — the Directioner account hub
+
+Note the asymmetry on /model: on Beyonders the equivalent takes a value and would
+silently drop it, because the metadata it sets is honored only for free-mode
+traffic (isDirectionerOriginatedRequest). It is Directioner-only for that reason.
+
+
+--------------------------------------------------------------------------------
+7. KEYBOARD SHORTCUTS AND INPUT MODES
+--------------------------------------------------------------------------------
+
+From cli/src/components/help-banner.tsx, which is what /help and "?" display.
+Three groups.
+
+Compose:
+  /            Commands (opens the slash menu)
+  @files       Mention files
+  @agents      Use an agent
+  Ctrl+J       New line
+  Opt+Enter    New line
+  /bash        Shell command
+
+Chat:
+  ?            Help (when input is empty)
+  ←            History (when input is empty)
+  ↑ / ↓        Prompts (when input is empty)
+  /new         New chat
+  /model       Model / reasoning
+  Ctrl+Q       Edit queued messages
+
+Conversation:
+  Esc          Close help / stop the run
+  Ctrl+C       Clear / stop / quit
+  Ctrl+T       Expand / collapse agents
+  /copy        Copy chat
+  /export      Export chat
+  Drag         Select and copy text
+
+Input modes (the composer changes behavior; each has a slash command that enters
+it):
+  help        the help banner is showing
+  bash        /bash or a leading "!" — lines are shell commands
+  image       /image (Beyonders only) — attaches an image
+  interview   /interview — gathers requirements
+  plan        /plan — planning
+  skill       /skill:<name> with no args — waits for instructions
+
+Note the /help line in the banner is filtered out on Directioner when it does not
+apply, and content rows are computed from IS_HOSTED.
+
+
+--------------------------------------------------------------------------------
+8. THE AGENT TOOL SET (37 TOOLS, ONE BY ONE)
+--------------------------------------------------------------------------------
+
+These are the tools the model can call. Canonical list:
+common/src/tools/constants.ts -> toolNames. Handlers:
+packages/agent-runtime/src/tools/handlers/tool/*.ts. Descriptions:
+common/src/tools/params/tool/*.ts.
+
+READING THE CODEBASE
+  read_files
+      Read whole files or line ranges. The primary way the agent sees content.
+
+  read_subtree
+      Read a directory subtree and return a blob of subdirectories, file names,
+      and parsed variable/function names. This is the structural map — the
+      single biggest context-cost saver, because the agent learns the shape of
+      a tree without reading every file body.
+
+  list_directory
+      List a directory's entries.
+
+  find_files
+      Retrieve the files most relevant to a request, to satisfy it without
+      reading the whole repo. Backed by file-finding subagents.
+
+  glob
+      Find files by name pattern rather than by content.
+
+  code_search
+      Search file contents by pattern. Uses ripgrep (rg), a fast line-oriented
+      search tool. The description explicitly says to use it only when
+      read_files is insufficient, and to be as constraining as possible: Rust
+      regex syntax, not grep/PCRE/RE2/JS regex.
+
+WRITING
+  write_file
+      Write a file. Path is relative to the project root.
+
+  str_replace
+      Replace an exact string in a file. Path relative to project root. The
+      standard surgical edit.
+
+  apply_patch
+      Apply a structured patch. Handles multi-file and multi-hunk changes.
+
+  propose_write_file
+      Present a write for approval rather than committing it. Part of the
+      proposal mechanism.
+
+  propose_str_replace
+      Present a string replacement for approval.
+
+  run_file_change_hooks
+      Trigger client-configured file-change hooks for given files — lets the
+      backend request that the client run project hooks after edits.
+
+EXECUTION
+  run_terminal_command
+      Run a shell command and capture output. See section 9 for the timeout
+      rules, which are non-obvious and important.
+
+EXTERNAL KNOWLEDGE
+  web_search
+      Search the web for current information. Uses Serper's Google Search API.
+
+  read_url
+      Fetch a URL returned by web_search and extract the readable page text, so
+      answers carry source-backed evidence.
+
+  read_docs
+      Get current documentation for libraries and frameworks. Searches
+      Context7's docs.
+
+  gravity_index
+      Discover, inspect, and report integrations for third-party developer
+      services — databases, auth, payments, hosting, email, cache, monitoring,
+      analytics, AI, storage, CMS, search. Agents are instructed to consult it
+      before recommending a service rather than working from memory. See
+      packages/agent-runtime/src/tools/gravity-index-cta.ts for the
+      "Gravity Index" call-to-action pattern.
+
+DELEGATION
+  spawn_agents
+      Spawn subagents. The main orchestration primitive — several can run for
+      one request.
+
+  spawn_agent_inline
+      Spawn an agent inline in the conversation. Present in toolNames but
+      commented out of publishedTools, so it is internal-only.
+
+  lookup_agent_info
+      Look up an agent's definition — what it is and what it accepts.
+
+CONVERSATION AND CONTROL
+  add_message
+      Add a message to the transcript without ending the step.
+
+  set_messages
+      Set the conversation history to the provided messages.
+
+  set_output
+      Set the final output. Collapsed by default in the UI
+      (COLLAPSED_BY_DEFAULT_TOOL_NAMES).
+
+  end_turn
+      End the turn.
+
+  task_completed
+      Signal that the task is done.
+
+  ask_user
+      Ask the user a question. Used heavily by /interview. Also the mechanism
+      for multiple-choice forms (cli/src/components/ask-user/).
+
+  skill
+      Load and run a skill by name. See section 15.
+
+PLANNING AND REASONING
+  create_plan
+      Produce a detailed plan to solve the request.
+
+  add_subgoal / update_subgoal
+      Build and maintain a subgoal list. add_subgoal takes a concise objective;
+      update_subgoal takes a subgoal id.
+
+  write_todos
+      Maintain a todo list across the turn.
+
+  think_deeply
+      Dedicated reasoning step with no side effects.
+
+  suggest_followups
+      Suggest next steps when ending a turn. There is shared style guidance
+      (FOLLOWUP_STYLE_GUIDANCE in agents/constants.ts) requiring each suggestion
+      be short, goal-oriented, and self-contained.
+
+UI AND REPORTING
+  render_ui
+      Render UI — the CLI has a component set for this
+      (cli/src/components/tools/, including render-ui).
+
+  report_project_profile
+      Report a profile of the project.
+
+  browser_logs
+      Read console.log output and errors from a browser, so the agent can debug
+      a running web app.
+
+  cloud_plan_ready
+      Signal plan readiness for the Cloud surface.
+
+COMPOSIO (managed integrations)
+  composio_search_tools
+  composio_get_tool_schemas
+  composio_manage_connections
+  composio_multi_execute_tool
+      A meta-tool layer over Composio, which brokers hundreds of third-party
+      integrations. The agent searches for a tool, reads its schema, executes
+      it, and manages connections — rather than each integration being
+      hardcoded.
+
+Published versus internal: common/src/tools/constants.ts also defines
+publishedTools, which is the same list minus spawn_agent_inline. That is the
+set exposed when agents are published to the store.
+
+
+--------------------------------------------------------------------------------
+9. TOOL EXECUTION RULES
+--------------------------------------------------------------------------------
+
+These are the non-obvious behaviors, and they matter in practice.
+
+Tools that do NOT force the agent to advance its step
+(TOOLS_WHICH_WONT_FORCE_NEXT_STEP):
+  think_deeply, set_output, set_messages, add_message, update_subgoal,
+  create_plan, render_ui, suggest_followups, suggest_prompts, task_completed,
+  report_project_profile
+Calling one of these does not end the step; the agent keeps going. Everything
+else does advance, which is how a multi-tool turn is sequenced.
+
+Terminal command timeouts — the clamp
+(common/src/tools/params/tool/run-terminal-command.ts):
+  - Default when unspecified: 30 seconds.
+  - Maximum for a SYNC command: 600 seconds (10 minutes). A model-supplied
+    value is clamped down to this.
+  - -1 is a sentinel meaning explicitly indefinite. It is preserved, not
+    clamped.
+  - Zero or negative values other than -1 fall back to 30.
+  - The comment states the cap exists because models were picking 3-, 10-, and
+    50-minute budgets for work that finishes in seconds, and the user pays the
+    whole budget watching nothing happen when a command hangs.
+  - Genuinely open-ended work has two intended doors: -1 for an explicit
+    indefinite wait, and process_type: BACKGROUND for long-running processes.
+
+Why this matters: a SYNC command that waits on stdin will otherwise hang the
+agent until the timeout. Prefer BACKGROUND or -1 deliberately rather than by
+accident.
+
+Tool errors are conversation, not crashes. A failed tool call is returned to the
+model as a message and the model is expected to recover. This is why the error
+text for a failed edit describes what went wrong rather than just failing.
+
+
+--------------------------------------------------------------------------------
+10. AGENT MODES
+--------------------------------------------------------------------------------
+
+Four modes. Source: cli/src/utils/constants.ts -> AGENT_MODE_TO_ID.
+
+  DEFAULT
+      The standard mode. On the CLI this runs the base3 harness
+      (CLI_HARNESS = 'base3'). Agent root: base3.
+
+  LITE
+      A cheaper, faster mode. In Directioner this maps to agent root base2-free
+      with cost mode 'free' — it resolves through your selected Directioner model
+      at send time. On paid Beyonders it maps to a paid lite root instead.
+
+  MAX
+      The heavyweight mode. Runs agent root base2-max: the multi-prompt editor
+      and the reviewer fan-out. It never moved to base3, and the source notes
+      that "the ceremony IS the product there."
+
+  PLAN
+      Planning only. Runs agent root base2-plan and never touches a file. Also
+      stayed on base2, because windowed reads and single-loop execution buy it
+      nothing and its <PLAN> flow is tuned against base2.
+
+Cost modes (AGENT_MODE_TO_COST_MODE):
+  DEFAULT -> normal
+  LITE    -> free (Directioner) / lite (Beyonders)
+  MAX     -> max
+  PLAN    -> normal
+
+The important subtlety: Directioner does not expose /mode:* commands, so mode
+selection happens through the model picker and session flow rather than typed
+mode switches. MAX and PLAN are structurally pinned to base2 and are unaffected
+by the CLI_HARNESS setting.
+
+
+--------------------------------------------------------------------------------
+11. THE AGENT ROSTER (110 AGENTS)
+--------------------------------------------------------------------------------
+
+The agents/ directory defines 110 agent ids. They fall into families.
+
+ROOT / HARNESS AGENTS
+  base3, base3-lite          — the CLI's DEFAULT and LITE harnesses
+  base2, base2-lite          — the previous harness; still used by MAX/PLAN
+  base2-free                 — what Directioner LITE resolves to
+  base2-max                  — MAX mode root
+  base2-plan                 — PLAN mode root
+  base-chat                  — plain chat, no repo work
+  base2-fast, base2-fast-no-validation
+  base2-kimi-2-7-code, base2-mimo, base2-gemini-evals
+
+FILE FINDING AND EXPLORATION
+  file-picker, file-picker-max     — pick the files relevant to a request
+  file-lister, file-lister-max     — list candidate files
+  code-searcher                    — run code search queries
+  directory-lister                 — list directories
+  glob-matcher                     — match glob patterns
+
+REVIEW
+  code-reviewer                    — the base reviewer
+  code-reviewer-multi-prompt       — fan-out reviewer
+  code-reviewer-lite
+  code-reviewer-gpt, code-reviewer-opus
+  code-reviewer-deepseek, code-reviewer-deepseek-flash
+  code-reviewer-glm, code-reviewer-glm-5-3-flash
+  code-reviewer-gemini-3-8-flash
+  code-reviewer-luna, code-reviewer-luna-6
+  code-reviewer-mimo, code-reviewer-mimo-2-6-pro
+  code-reviewer-minimax-m3
+  code-reviewer-muse-spark, code-reviewer-muse-spark-1-3
+  code-reviewer-solar-pro4, code-reviewer-solar-mini4
+  code-reviewer-ox-alpha, code-reviewer-space-bunny-alpha, code-reviewer-fable
+  Note: reviewer variants exist per model, because a review is often run on a
+  cheaper model than the implementing one.
+
+EDITING
+  editor, editor-gpt-5
+  editor-multi-prompt
+  editor-implementor, editor-implementor-gpt-5, editor-implementor-opus
+
+THINKING
+  thinker
+  thinker-gpt, thinker-gemini, thinker-with-files-gemini
+  thinker-best-of-n, thinker-best-of-n-opus
+  thinker-selector, thinker-selector-opus
+  best-of-n-selector2
+
+RESEARCH
+  researcher-web   — answers questions using web search
+  researcher-docs  — answers from documentation
+  librarian        — handles heavy retrieval jobs (its documented budget example
+                     is a 180-second `git clone`)
+
+OTHER
+  basher           — runs terminal commands as a subagent
+  browser-use      — drives a real browser
+  context-pruner   — compacts context; hidden from the UI
+                     (HIDDEN_AGENT_IDS = ['context-pruner'])
+  tmux-cli, tmux-cli-fable  — drive a CLI inside tmux
+  general-agent, opus-agent, gpt-5-agent
+
+Free-tuned roots (the base2-free-*/base3-free-* family) map one-to-one onto the
+Directioner model catalog: one root per selectable model, and each root is pinned
+to exactly one model id. That pinning is load-bearing — the rate-limit queue
+accounts per model, so a root allowed more than one model would let a turn
+escape the queue's bookkeeping. See common/src/constants/free-agents.ts.
+
+UI COLLAPSING RULES (cli/src/utils/constants.ts):
+  Collapsed by default when spawned:
+    file-picker, code-reviewer-selector, thinker-selector, best-of-n-selector,
+    basher, code-searcher, directory-lister, glob-matcher, researcher-web,
+    researcher-docs
+  Parent-child rule: code-reviewer-multi-prompt collapses its code-reviewer
+  children.
+  Ctrl+T expands/collapses agents (this is why that key exists).
+
+
+--------------------------------------------------------------------------------
+12. THE MODEL CATALOG
+--------------------------------------------------------------------------------
+
+Directioner ships a curated catalog rather than a raw provider list. The regular
+picker, per README.md and common/src/constants/directioner-models.ts:
+
+  GLM 5.3 Flash          The default everywhere. Deepest reasoning, unmetered.
+  DeepSeek V4.1 Flash    Fast coding and tool use, unmetered.
+  GPT-6 Luna             Strong all-around with native images.
+  MiMo 2.6 Flash         Balanced, with image support.
+  MiMo 2.6 Pro           Xiaomi's stronger reasoning model, image support.
+  Solar Mini 4           Upstage, fast and compact. 524K context, text only.
+  Solar Pro 4            Upstage, larger and stronger. 524K context, text only.
+  Space Bunny Alpha      Beta stealth model, 1M context, images. Retains prompts.
+  Gemini 3.8 Flash       Paid plans. 1M context; the only model accepting audio,
+                         video, and PDF.
+  Muse Spark 1.2         Meta's agentic coding model, 1M context. Rate limited
+                         and shared by all users, so it queues when busy and
+                         answers on DeepSeek V4 Flash instead of making you wait.
+
+Unmetered at full access (cost no session at all): GLM 5.3 Flash,
+DeepSeek V4.1 Flash, MiMo 2.6 Flash, Solar Mini 4, Solar Pro 4.
+
+Limited tier (LIMITED_HOSTED_MODEL_IDS), in order, hero first:
+  GLM 5.3 Flash (the limited hero), DeepSeek V4.1 Flash, MiMo 2.6 Flash,
+  Solar Mini 4, Solar Pro 4.
+  The limited tier is metered by REGION rather than by model.
+  LIMITED_HOSTED_MODEL_MISMATCH_MESSAGE is derived from this list, so the
+  error message cannot lag the catalog.
+
+Specialist, not in the main picker: Gemini 3.1 Flash Lite powers file finding
+and research.
+
+Retired: DeepSeek V4 Pro (replaced by GLM 5.3 Flash as the deep-reasoning pick).
+Withdrawn: Ox Alpha (paused 2026-08-27; its allowlist entry stays so live
+sessions can drain rather than fail mid-turn).
+
+Catalog mechanics worth knowing:
+  - Many full-access ids are deliberately absent from the limited list.
+  - Retiring a row is not a no-op for installed clients: admission coerces
+    their pick, and the chat gate substitutes rather than refuses. This is
+    described in the source as avoiding client wedge (#1801).
+  - Models may serve from a quantized (Q8_0) build.
+  - The subscription tiers live in common/src/constants/directioner-subscriptions.ts
+    with prices, but not Stripe price ids — those are server env keyed by tier
+    id.
+
+For BYOK, none of this applies: you run whatever model you configured.
+
+
+--------------------------------------------------------------------------------
+13. REASONING EFFORT
+--------------------------------------------------------------------------------
+
+One shared vocabulary across all surfaces, from
+common/src/constants/reasoning-effort.ts. ORDERED ascending, and the order is
+load-bearing — clamping does index arithmetic on it.
+
+  minimal, low, medium, high, xhigh, max, ultra
+
+Default: high.
+
+Not every rung reaches every provider: `ultra` exists only for local CLI
+harnesses, Meta tops out at `xhigh`, and both DeepSeek V4 models expose
+low/high/max with nothing between. A model's own `efforts` array defines what it
+offers, and clamping stops one model's rung from reaching another's API.
+
+In the CLI, reasoning is chosen where the banner says "Model / reasoning" — the
+model picker (/model, or Ctrl+Q-adjacent flows).
+
+
+--------------------------------------------------------------------------------
+14. BYOK (BRING YOUR OWN KEY)
+--------------------------------------------------------------------------------
+
+Directioner's escape hatch: run against your own provider account so a turn costs
+no Freebucks and needs no session. This is the one route that works from the
+"wall" screens (out of Freebucks, daily cap reached), which is exactly why the
+command exists.
+
+Usage, verbatim from cli/src/commands/byok.ts:
+
+  /byok list
+  /byok add <name> <openrouter|openai-compatible> <model> <ENV_VAR> \
+        [base-url] [--context-window=N] [--max-output-tokens=N]
+  /byok update <name> <model> [base-url] \
+        [--context-window=N] [--max-output-tokens=N]
+  /byok validate <name>
+  /byok select <name>
+  /byok remove <name>
+  /byok off
+
+Security properties, stated in the source:
+  - Keys are read from an environment variable and NEVER stored in Directioner.
+  - You supply the environment-variable NAME (for example OPENROUTER_API_KEY),
+    never the key itself. The help text explicitly says never paste an API key
+    into this command.
+  - Setup arguments are kept out of command history even when credential
+    heuristics do not recognize the value, because a pasted key can have any
+    vendor-specific shape.
+
+Workflow: add a connection, /byok select <name> to start using it, /byok off to
+return to Directioner's own models.
+
+Two providers are supported: openrouter, and openai-compatible (any endpoint
+speaking that API, with an optional base URL).
+
+
+--------------------------------------------------------------------------------
+15. CONTEXT FILES AND SKILLS
+--------------------------------------------------------------------------------
+
+What the agent reads from your repository to understand it.
+
+  AGENTS.md
+      Repository instructions, at the root. Read on every turn.
+
+  knowledge.md
+      The starter knowledge file. Note: /init, the command that creates it, is
+      REMOVED in Directioner — so this build does not offer the scaffolder, though
+      the file is still a valid instructions target.
+
+  .agents/ (project and parent)
+      Repository-scoped agent definitions and configuration.
+
+  ~/.agents/ (global)
+      Your own agent definitions and skills. Overrides or is overridden by
+      project scope — project skills override global ones (the SDK handles the
+      merge).
+
+  .agents/skills/
+      Skills: reusable, self-contained instructions. A skill is a directory with
+      a SKILL.md carrying frontmatter (name, description) and content.
+
+  mcp.json
+      MCP (Model Context Protocol) server configuration. stdio servers are
+      spawned on the first prompt.
+
+  .beyondersignore
+      Ignore rules for search and context selection, in addition to the usual
+      .gitignore.
+
+Skills in the CLI:
+  - Loaded from ~/.agents/skills (global) and {projectRoot}/.agents/skills
+    (project), by cli/src/utils/skill-registry.ts via the SDK.
+  - Each becomes a slash command: /skill:<name>.
+  - Invoked with no argument, it enters skill mode so you can add instructions.
+  - Skills can also be discovered and installed from the community:
+      npx skills find <query>
+      npx skills add <owner/repo> --list
+      npx skills add <owner/repo> --skill <name> --yes
+    These install into .agents/skills/. The source is explicit that community
+    skills are NOT vetted and that you should confirm with the user before
+    installing.
+  - A skill is delivered to the model wrapped in a <skill name="..."> block,
+    byte-identical whether invoked via /skill:<name> with trailing text or via
+    skill mode, so the two paths cannot drift.
+
+Prompt builders for the built-in flows (cli/src/commands/prompt-builders.ts):
+  /plan     "Gather all the relevant context and then think carefully about how
+             to implement the following:"
+  /review   "Please gather all relevant context and then carefully review:"
+  /interview Requires at least 3 rounds of ask_user, all questions through the
+             tool rather than prose, then writes <name>-spec.md and makes no
+             code changes.
+
+
+--------------------------------------------------------------------------------
+16. TRUST, PERMISSIONS, AND SECRETS
+--------------------------------------------------------------------------------
+
+The trust gate is the most security-relevant mechanism here, because it guards
+code execution at startup. Source: cli/src/utils/agent-dir-trust.ts.
+
+THE PROBLEM IT SOLVES
+  Loading a repository's .agents directory dynamically imports every .ts/.js
+  file under {cwd}/.agents and {cwd}/../.agents. Loading mcp.json spawns stdio
+  MCP servers on the first prompt, with $VAR references filled from THIS
+  process's environment. Both run attacker-authored code the moment the CLI
+  starts inside a cloned repository — before you have typed anything.
+
+THE GATE
+  - A directory containing anything executable must be trusted once by the user
+    before it is loaded. You get an interactive prompt.
+  - ~/.agents is your own and never needs trust.
+  - A directory holding only skills/ markdown does not need trust.
+  - Trust is recorded per ABSOLUTE directory path in
+    <configDir>/trusted-agent-dirs.json, file mode 0600.
+  - Non-interactive runs NEVER prompt: they skip the directory and say so —
+    unless you opt in with BEYONDERS_TRUST_AGENT_DIRS=1 or --trust-agents.
+
+Practical reading: cloning a repo and running the agent in it is the exact
+sequence this gate exists to interrupt. Do not blanket-opt-in for repositories
+you have not looked at.
+
+Other security properties found in the source:
+
+  Config directory confinement. DIRECTIONER_CONFIG_DIR must be an ABSOLUTE path.
+  The code throws if it is relative, specifically so CLI settings cannot be
+  written relative to the current project — that would let a repository redirect
+  where settings land.
+
+  Environment validation. The binary validates NEXT_PUBLIC_* configuration at
+  startup and refuses to run if it is missing. This is also why a build must
+  inline those values.
+
+  Agent visibility. context-pruner is hidden from the UI
+  (HIDDEN_AGENT_IDS), so compaction work is not presented as a user-facing
+  agent.
+
+  Secrets handling. BYOK never stores keys and keeps setup args out of history.
+  Separately, token-level secret detection exists in cli/src/utils (see the
+  secret-masking helpers) to keep recognized credentials out of prompts and
+  logs.
+
+  Ads and cells. The sponsored-proposal channel binds no bare keys, so an ad
+  card cannot intercept your typing. All its controls are explicit commands
+  (section 5).
+
+Local state that is NOT executable and needs no trust: .directioner/project-id
+(a generated UUID marking that this directory has been used), chat storage, and
+the config directory.
+
+
+--------------------------------------------------------------------------------
+17. ON-DISK LAYOUT
+--------------------------------------------------------------------------------
+
+CONFIG DIRECTORY
+  ~/.config/directioner
+    or ~/.config/directioner-<environment> on a non-production stack
+    (the suffix comes from NEXT_PUBLIC_CB_ENVIRONMENT).
+  Overridable with DIRECTIONER_CONFIG_DIR — which must be absolute.
+
+  Contains:
+    trusted-agent-dirs.json   trust records, mode 0600
+    session/chat storage
+    settings, theme, analytics id, log files
+
+PROJECT DIRECTORY
+  .directioner/project-id    a UUID generated on first run in this directory
+                          (gitignored by the repo's own .gitignore)
+
+  .beyondersignore         ignore rules
+  AGENTS.md, knowledge.md context files
+  .agents/                project agent definitions, skills/, mcp.json
+
+REPOSITORY (the monorepo this build comes from)
+  cli/                    the CLI: TUI, commands, state, components
+  sdk/                    the SDK the CLI is built on
+  common/                 shared types, constants, tool schemas
+  agents/                 the 110 agent definitions
+  packages/agent-runtime/ the agent loop, tool handlers, prompts
+  packages/code-map/      structural parsing
+  packages/llm-providers/ provider shims
+  evals/                  evaluations
+  directioner/               the Directioner build entry point
+  scripts/, docs/, assets/
+
+LOG FILES
+  Written under the config directory. Beyonders has --clear-logs to remove them
+  before starting; Directioner does NOT expose that flag.
+
+
+--------------------------------------------------------------------------------
+18. SESSIONS AND HISTORY
+--------------------------------------------------------------------------------
+
+  /new (n, clear, c, reset)
+      Clears the conversation and ROTATES to a fresh chat directory, so the next
+      message does not overwrite the previous conversation's history. It aborts
+      any in-flight run first — the source notes an orphaned run would keep
+      streaming after the switch and persist the old conversation's state under
+      the new chat id.
+
+  /history (chats)
+      Browse and resume past conversations.
+
+  --continue [conversation-id]
+      Resume from argv. No id continues the most recent.
+
+  /end-session
+      End the current session and return to the Directioner landing screen. Your
+      next message starts a new one.
+
+  /export (export-chat)
+      Write the conversation to a file. .md for readable, .json for raw
+      messages.
+
+  /copy (copy-chat)
+      Copy the full conversation including tool results.
+
+  /queue (queued)
+      Edit, reorder, or delete messages waiting to be sent. Ctrl+Q does the same.
+
+  Queuing mid-turn: if you submit while the agent is streaming, the message is
+  queued rather than interleaved. The registry checks the queue before allowing
+  a steering submit, so a mid-turn message cannot overtake earlier queued ones.
+
+  Context compaction: context-pruner summarizes history as it grows. Handled
+  without user-facing ceremony, which is also why an early constraint can
+  silently drop out of a long session — restating it or putting it in AGENTS.md
+  is the fix.
+
+
+--------------------------------------------------------------------------------
+19. ADS (HOW THE FREE TIER IS FUNDED)
+--------------------------------------------------------------------------------
+
+Worth stating explicitly, because it explains several odd-looking commands: the
+free access is supported by text advertising. README.md says so plainly —
+"Text ads support access to the included models."
+
+Consequences visible in this codebase:
+
+  - There is an ads subsystem (cli/src/ads/, cli/src/commands/ads.ts).
+  - /ads:enable and /ads:disable exist on Beyonders but are REMOVED in Directioner.
+  - The sponsored-proposal family (section 5) remains, and controls a card that
+    offers a proposal you can accept, dismiss, undo, report, or decline
+    permanently, plus an option to stop proposals entirely.
+  - The card deliberately binds no bare keys; all interactions are commands, so
+    an advertisement can never swallow your keystrokes.
+  - cli/src/utils/sponsored-cli-capability.ts inspects a project for signs it is
+    capable of specific work (migration directories for Supabase/Prisma/Drizzle,
+    a Vite config, and so on) — i.e. context used to decide what is relevant to
+    offer.
+  - The README also notes referrals and bounties can earn extra sessions.
+
+If you want none of this: /byok to run on your own key, /ads:proposals-off, and
+/byok off only when you want Directioner models back.
+
+
+--------------------------------------------------------------------------------
+20. ARCHITECTURE AND THE BUILD
+--------------------------------------------------------------------------------
+
+LANGUAGE AND RUNTIME
+  TypeScript, bundled and run by Bun. .bun-version pins the version. bun.lock is
+  the lockfile; dependencies currently match it exactly.
+
+BUILD ENTRY POINTS
+  SDK:       sdk/scripts/build.ts      (bun bundler + dts-bundle-generator)
+  Directioner:  directioner/cli/build.ts     wraps cli/scripts/build-binary.ts with
+                                       HOSTED_MODE=true
+  Usage:     bun directioner/cli/build.ts <version>
+
+  The HOSTED_MODE=true flag is compile-time. The bundler uses it for
+  dead-code elimination, which is how the paid commands physically disappear
+  from the binary rather than being hidden at runtime.
+
+  output: cli/bin/directioner, plus a sibling tree-sitter.wasm copied from
+  node_modules/web-tree-sitter.
+
+BUILD REQUIREMENTS — the trap
+  NEXT_PUBLIC_* values are inlined at build time and validated at startup. A
+  binary built without them fails environment validation on launch, which
+  presents as mysterious probe failures rather than an obvious error. Values
+  used for a local build:
+
+    NEXT_PUBLIC_CB_ENVIRONMENT=prod
+    NEXT_PUBLIC_BEYONDERS_APP_URL=https://beyonders.com
+    NEXT_PUBLIC_SUPPORT_EMAIL=support@beyonders.com
+    NEXT_PUBLIC_POSTHOG_API_KEY=...
+    NEXT_PUBLIC_POSTHOG_HOST_URL=https://us.i.posthog.com
+    NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=...
+    NEXT_PUBLIC_STRIPE_CUSTOMER_PORTAL=...
+    NEXT_PUBLIC_WEB_PORT=3000
+
+  The last value, NEXT_PUBLIC_BEYONDERS_APP_URL, is the single setting that
+  decides where your code is sent. It is the most important line in any build.
+
+A KNOWN UPSTREAM BREAKAGE (fixed in this checkout)
+  The public snapshot as published does not build: `bun run build:sdk` fails
+  while bundling declarations, and that aborts the binary build. Every upstream
+  Public CI run fails at the same "Build SDK" step. Cause: the AI SDK v7 types
+  JSONValue as Readonly<JSONObject> | readonly JSONValue[], while this repo's
+  JSONArray was declared mutable (JSONValue[]). A mutable array assigns to a
+  readonly one but not the reverse, so every ProviderMetadata value was
+  rejected, cascading into 40+ errors across sdk, common, and agent-runtime.
+  Fix: declare the object and array branches readonly in
+  common/src/types/json.ts. No runtime change. Currently committed on branch
+  build/fix-ai-sdk-json-types.
+
+DEPENDENCY NOTES
+  ai@7.0.118, @ai-sdk/provider@2.0.3, OpenTUI 0.3.4 (the terminal UI layer,
+  which is where most of the rendering code lives).
+
+LAYER MAP
+  entry.ts -> cli-args.ts (argv) -> pre-init (env validation) -> init (login,
+  native setup, skill registry) -> app.tsx (TUI root) -> chat.tsx -> the state
+  stores in cli/src/state/ -> command router -> agent-runtime on the SDK.
+  The TUI is built on OpenTUI with React-style components.
+
+
+--------------------------------------------------------------------------------
+21. DISTRIBUTION AND UPDATES
+--------------------------------------------------------------------------------
+
+This is the wrapper + native binary shape, and knowing that explains several
+things about how Directioner arrives.
+
+THE NPM PACKAGE IS A LAUNCHER, NOT THE AGENT
+  The published package directioner@0.1.2 contains exactly four files:
+    index.js, launcher.js, http.js, README.md
+  It is a downloader. It fetches a precompiled native binary for your OS and
+  architecture and execs it. Properties:
+    - bin: directioner -> index.js
+    - os: darwin, linux, win32
+    - cpu: x64, arm64
+    - engines: node >= 16
+    - dependencies: tar (for extracting the download)
+    - prepack/postpack run cli/release-core/prepare-package.js
+    - publishConfig: access public, provenance FALSE
+  Consequence: reading the npm package tells you nothing about how the agent
+  works. The agent is inside the binary.
+
+THE REAL SOURCE
+  github.com/BeyondersAI/directioner — public, Apache-2.0. Note that package.json's
+  repository field points at directioner-private (which is not publicly reachable);
+  the public mirror is the directioner repo, and it is the full client source. The
+  server, database, billing, and deployment code are NOT in it — the client is
+  open, the hosted service is not.
+
+UPDATES
+  There is a deferred-update mechanism (cli/src/__tests__/release/
+  deferred-update.test.ts). The shape: a newer version is staged and applied
+  later — on the next launch or on exit. Deferring until exit matters, because
+  replacing the binary underneath a long-lived session is not safe.
+
+PROVENANCE QUESTIONS THAT MATTER
+  - Provenance is disabled for this package, so builds are not attested.
+  - Per-platform checksums exist for the downloaded binary; the launcher
+    verifies them.
+  - The download is a network fetch during install. In a locked-down environment
+    that blocks install-time network access, the install fails even though it
+    looks like a trivial dependency.
+  - The package version and the downloaded binary version are separate facts.
+
+
+================================================================================
+QUICK RECAP
+================================================================================
+
+Commands     19 slash commands in the menu, plus /skill:<name>; 4 implicit
+             (help, new, logout, exit); an ads-proposal family that dispatches
+             but is not menu-listed.
+Flags        -v/--version, --continue [id], --cwd <dir>, --trust-agents,
+             -h/--help, and the single positional `login`.
+Tools        37 tools: read/write/search/execute, web + docs + gravity_index,
+             spawn_agents, planning and todo tools, ask_user, skill, UI and
+             browser reporting, and 4 Composio meta-tools.
+Modes        DEFAULT (base3), LITE (base2-free in Directioner, cost mode 'free'),
+             MAX (base2-max), PLAN (base2-plan).
+Agents       110 ids across roots, file-finding, review, editing, thinking,
+             research, and utilities.
+Models       GLM 5.3 Flash (default, unmetered) and the curated catalog;
+             limited tier of five; BYOK for anything else.
+Effort       minimal, low, medium, high (default), xhigh, max, ultra.
+Trust        .agents dirs and mcp.json need one-time trust before they execute;
+             recorded in trusted-agent-dirs.json, mode 0600.
+Funding      Text ads plus sponsored proposals; BYOK is the no-cost-of-session
+             escape route.
+Build        bun directioner/cli/build.ts <version> with HOSTED_MODE=true and
+             NEXT_PUBLIC_* inlined, or startup env validation fails.
+================================================================================

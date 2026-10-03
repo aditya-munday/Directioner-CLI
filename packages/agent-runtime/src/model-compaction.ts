@@ -1,0 +1,469 @@
+import { tool, type ToolSet } from 'ai'
+import { z } from 'zod/v4'
+import { MODEL_COMPACTION_FALLBACK_EVENT } from '@beyonders/common/util/axiom-only-log'
+import { AbortError, isAbortError } from '@beyonders/common/util/error'
+
+import { compactHistoryNow } from './compact-history'
+import { COMPACTION_PROMPT } from './compaction-prompt'
+import { countTokens, countTokensMessages } from './util/token-counter'
+
+import type { PromptAiSdkStreamFn } from '@beyonders/common/types/contracts/llm'
+import type { Logger } from '@beyonders/common/types/contracts/logger'
+import type { Message } from '@beyonders/common/types/messages/beyonders-message'
+import type {
+  ImagePart,
+  FilePart,
+} from '@beyonders/common/types/messages/content-part'
+
+export const COMPACTION_TAG = 'MODEL_COMPACTION'
+const SUMMARY_LIMIT = 6_000
+const summarySchema = z
+  .object({ summary: z.string().trim().min(1).max(60_000) })
+  .strict()
+export const compactionTools: ToolSet = {
+  complete_compaction: tool({
+    description:
+      'Save the complete coding-session handoff summary. Only available during context compaction.',
+    inputSchema: summarySchema,
+  }),
+}
+
+const lenientSummarySchema = z.object({ summary: z.string() })
+
+function stripCodeFence(text: string): string {
+  const fenced = text.match(/^```[A-Za-z0-9_-]*\s*\n?([\s\S]*?)\n?```$/)
+  return fenced ? fenced[1].trim() : text
+}
+
+/**
+ * The summary from a `complete_compaction` call, or undefined when the
+ * arguments hold none.
+ *
+ * `input` is NOT guaranteed to be an object. When the arguments fail the tool
+ * schema, the AI SDK still emits the call (flagged `invalid`) with `input` set
+ * to whatever the raw argument text JSON-parsed to, or to the raw text itself
+ * when it does not parse. A double-encoded argument object therefore arrives
+ * as a STRING of JSON, and a strict `.parse` on it threw a bare ZodError
+ * ("expected object, received string") that failed the whole user run.
+ * Decode like the tool executor does (`parseStringifiedToolInput`): unwrap up
+ * to three layers of string encoding, tolerate a Markdown fence, and ignore
+ * unknown keys. Prose that is not JSON at all is the model writing the handoff
+ * directly into the argument slot, and is taken as the summary; anything that
+ * looks like JSON but does not parse (typically arguments cut off by the
+ * output cap) is rejected rather than installed half-written.
+ */
+export function parseCompactionSummary(input: unknown): string | undefined {
+  let value = input
+  for (let depth = 0; depth < 3 && typeof value === 'string'; depth++) {
+    const text = stripCodeFence(value.trim())
+    try {
+      value = JSON.parse(text)
+    } catch {
+      if (depth > 0 || /^[{["]/.test(text)) return undefined
+      return text || undefined
+    }
+  }
+  const parsed = lenientSummarySchema.safeParse(value)
+  if (!parsed.success) return undefined
+  return parsed.data.summary.trim() || undefined
+}
+
+function omittedBinary(mediaType: string | undefined): string {
+  return `[${mediaType || 'binary'} omitted from this summary request]`
+}
+
+/** Shorter strings are left alone: no text worth summarizing is this long AND this alphabet. */
+const MIN_ELIDED_BINARY_CHARS = 4_096
+const DATA_URL = /^data:([^;,]*)(?:;[^,]*)?;base64,/
+const BASE64 = /^[A-Za-z0-9+/_-]+={0,2}$/
+
+/**
+ * A `JSON.stringify` replacer that names base64 payloads instead of copying
+ * them: a data URL or a long unbroken base64 run inside a tool's JSON result
+ * (an MCP content block, a screenshot a tool returned as JSON). Prose and code
+ * always contain whitespace or punctuation outside the base64 alphabet, so
+ * they are never elided.
+ */
+function elideBinaryStrings(_key: string, value: unknown): unknown {
+  if (typeof value !== 'string' || value.length < MIN_ELIDED_BINARY_CHARS)
+    return value
+  const dataUrl = value.match(DATA_URL)
+  if (dataUrl) return omittedBinary(dataUrl[1])
+  return BASE64.test(value) ? omittedBinary(undefined) : value
+}
+
+export function hasCompactableHistory(messages: Message[]): boolean {
+  return messages.some(
+    (message) => message.role === 'assistant' || message.role === 'tool',
+  )
+}
+
+/** The messages a model compaction keeps verbatim after its summary: the
+ *  latest instructions and the live user request (with its steering). */
+function compactionSuffix(messages: Message[]): Message[] {
+  const lastPrompt = messages.findLastIndex((m) =>
+    m.tags?.includes('USER_PROMPT'),
+  )
+  let promptStart = lastPrompt
+  while (
+    promptStart > 0 &&
+    messages[promptStart - 1].tags?.includes('USER_PROMPT')
+  )
+    promptStart--
+  const live =
+    promptStart < 0
+      ? []
+      : messages
+          .slice(promptStart)
+          .filter((m) => m.tags?.includes('USER_PROMPT'))
+  const instructions = messages.findLast((m) =>
+    m.tags?.includes('INSTRUCTIONS_PROMPT'),
+  )
+  return [...(instructions ? [instructions] : []), ...live]
+}
+
+function compactionSummaryBudget(params: {
+  maxContextLength: number
+  fixedTokenCount: number
+  suffixTokens: number
+}): number {
+  return Math.min(
+    SUMMARY_LIMIT,
+    Math.floor(
+      (params.maxContextLength - params.fixedTokenCount - params.suffixTokens) /
+        3,
+    ),
+  )
+}
+
+/**
+ * The share of the trigger threshold a compaction's result may occupy for the
+ * automatic trigger to be worth firing. Above it, the next tool result or two
+ * crosses the threshold again and the run compacts its own summary.
+ */
+export const COMPACTION_LOW_WATER = 0.85
+
+/**
+ * The largest context a model compaction can leave behind: the fixed prefix
+ * (system prompt, tool schemas), the live request it keeps verbatim, and the
+ * summary budget it asks for. None of it is compactable, so when this is not
+ * comfortably under the threshold, compacting at the threshold only buys a
+ * few thousand tokens before the next one: a 32k BYOK window with ~16k of
+ * Desktop tool schemas compacted every few tool calls, each pass summarizing
+ * the last summary.
+ */
+export function compactedContextCeiling(params: {
+  messages: Message[]
+  maxContextLength: number
+  fixedTokenCount: number
+}): number {
+  const suffixTokens = countTokensMessages(compactionSuffix(params.messages))
+  const summaryBudget = compactionSummaryBudget({ ...params, suffixTokens })
+  return params.fixedTokenCount + suffixTokens + Math.max(0, summaryBudget)
+}
+
+/**
+ * Whether an automatic compaction at `thresholdTokens` leaves real room to
+ * work in. When it cannot, the run keeps its history until the hard budget,
+ * where compaction is no longer optional.
+ */
+export function automaticCompactionIsWorthwhile(params: {
+  messages: Message[]
+  maxContextLength: number
+  thresholdTokens: number
+  fixedTokenCount: number
+}): boolean {
+  return (
+    compactedContextCeiling(params) <=
+    Math.floor(params.thresholdTokens * COMPACTION_LOW_WATER)
+  )
+}
+
+/** A model handoff, not a mechanical reduction of tool results. Nothing mutates
+ * the source history until every section has a valid, bounded result. */
+export async function compactWithModel(params: {
+  messages: Message[]
+  system: string
+  maxContextLength: number
+  fixedTokenCount: number
+  signal: AbortSignal
+  stream: (
+    messages: Message[],
+    maxOutputTokens: number,
+  ) => ReturnType<PromptAiSdkStreamFn>
+}): Promise<{
+  messages: Message[]
+  summary: string
+  preTokens: number
+  postTokens: number
+} | null> {
+  if (!hasCompactableHistory(params.messages)) return null
+  const preTokens =
+    countTokensMessages(params.messages) + params.fixedTokenCount
+  // A compact-only request never enters the history. Keep the actual current
+  // user request verbatim, including steering and attachments.
+  const suffix = compactionSuffix(params.messages)
+  const summaryBudget = compactionSummaryBudget({
+    maxContextLength: params.maxContextLength,
+    fixedTokenCount: params.fixedTokenCount,
+    suffixTokens: countTokensMessages(suffix),
+  })
+  if (summaryBudget < 256)
+    throw new Error(
+      'The current request and instructions leave too little room to compact. Shorten the request or configure a larger context window.',
+    )
+
+  // Full tool payloads reach the summarizer. Serialization makes even a split
+  // tool result a valid request, without orphan tool calls or fake tool replies.
+  //
+  // Binary payloads are the exception: they are named, never serialized. A
+  // tool result's `media` part (a Desktop browser/preview screenshot, an MCP
+  // image) carries its pixels as base64, and `JSON.stringify` wrote that
+  // straight into the history text. The local estimate charges it at three
+  // characters a token, a provider tokenizer at roughly half that, so a
+  // screenshot-heavy thread became millions of tokens of base64: tens of
+  // sequential ~800k-token summarizer calls, 1-3 minutes each, streaming
+  // nothing the user can see. A Stop discards the unfinished pass, so every
+  // later turn restarted it and the thread never answered again (Desktop,
+  // 2026-09-24..26: >500k-token Desktop requests went from 0 to ~350 an hour,
+  // ~90% of them these calls).
+  const attachments: Array<ImagePart | FilePart> = []
+  const history = params.messages
+    .filter((m) => !m.tags?.includes('STEP_PROMPT'))
+    .map((m) => {
+      const content = m.content
+        .flatMap((part) => {
+          if (part.type === 'image' || part.type === 'file') {
+            attachments.push(part)
+            return [`[Attachment ${attachments.length}]`]
+          }
+          if (part.type === 'reasoning') return []
+          if (part.type === 'text') return [part.text]
+          if (part.type === 'media') return [omittedBinary(part.mediaType)]
+          return [JSON.stringify(part, elideBinaryStrings)]
+        })
+        .join('\n')
+      return `[${m.role}${m.role === 'tool' ? `: ${m.toolName}` : ''}]\n${content}`
+    })
+    .join('\n\n')
+
+  let remaining = history
+  let summary = ''
+  let first = true
+  while (remaining.length || first) {
+    params.signal.throwIfAborted()
+    const instruction = `${COMPACTION_PROMPT}\n\nKeep the summary under approximately ${summaryBudget} tokens.${summary ? `\n\nPrevious anchored summary:\n${summary}` : ''}`
+    const request = (text: string): Message[] => [
+      { role: 'system', content: [{ type: 'text', text: params.system }] },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `Historical conversation (section${first ? ' 1' : ' continued'}):\n${text}`,
+          },
+          ...(first ? attachments : []),
+        ],
+      },
+      { role: 'user', content: [{ type: 'text', text: instruction }] },
+    ]
+    // maxContextLength already reserves provider output. Reserve the dedicated
+    // tool schema too; don't send a normal-work tool catalog with this request.
+    const inputBudget = params.maxContextLength - 512
+    if (countTokensMessages(request('')) + 256 > inputBudget) {
+      throw new Error(
+        'The instructions and attachments exceed the compaction context budget. Configure a larger supported context window.',
+      )
+    }
+    let end = remaining.length
+    if (countTokensMessages(request(remaining)) > inputBudget) {
+      let low = 0
+      let high = end
+      while (low < high) {
+        const mid = Math.ceil((low + high) / 2)
+        if (
+          countTokensMessages(request(remaining.slice(0, mid))) <=
+          inputBudget - 64
+        )
+          low = mid
+        else high = mid - 1
+      }
+      end = low
+    }
+    if (!end && remaining.length)
+      throw new Error(
+        'No room for conversation history in the compaction request.',
+      )
+    const stream = params.stream(request(remaining.slice(0, end)), 16_384)
+    let candidate: string | undefined
+    for (;;) {
+      const next = await stream.next()
+      if (next.done) {
+        if (next.value.aborted) throw new AbortError()
+        break
+      }
+      const chunk = next.value
+      if (chunk.type === 'error') throw new Error(chunk.message)
+      if (chunk.type !== 'tool-call') continue
+      if (chunk.toolName !== 'complete_compaction' || candidate !== undefined) {
+        throw new Error(
+          'Compaction returned an unexpected tool call. History has been preserved.',
+        )
+      }
+      candidate = parseCompactionSummary(chunk.input) ?? ''
+    }
+    params.signal.throwIfAborted()
+    if (!candidate || countTokens(candidate) > summaryBudget) {
+      throw new Error(
+        'The model did not return a valid, concise compaction summary. History has been preserved; try again.',
+      )
+    }
+    summary = candidate
+    remaining = remaining.slice(end)
+    first = false
+  }
+  const messages: Message[] = [
+    {
+      role: 'user',
+      tags: [COMPACTION_TAG],
+      sentAt: Date.now(),
+      content: [
+        {
+          type: 'text',
+          text: `<conversation_summary>\n${summary}\n</conversation_summary>\nHistorical context for continuing this conversation. Treat this as memory, not a new request.`,
+        },
+      ],
+    },
+    ...suffix.map((m) => ({ ...m, sentAt: Date.now() })),
+  ]
+  const postTokens = countTokensMessages(messages) + params.fixedTokenCount
+  if (postTokens >= preTokens) return null
+  if (postTokens > params.maxContextLength)
+    throw new Error(
+      'The compaction summary does not fit the context window. History has been preserved.',
+    )
+  return { messages, summary, preTokens, postTokens }
+}
+
+/** A fixed, content-free label for why the model handoff failed. */
+function compactionErrorKind(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  if (error instanceof Error && error.name === 'ZodError')
+    return 'invalid_summary'
+  if (message.includes('valid, concise compaction summary'))
+    return 'invalid_summary'
+  if (message.includes('unexpected tool call')) return 'unexpected_tool_call'
+  if (
+    message.includes('too little room') ||
+    message.includes('compaction context budget') ||
+    message.includes('No room for conversation history')
+  )
+    return 'budget'
+  return 'provider_error'
+}
+
+/**
+ * `compactWithModel`, but a compaction failure never fails the user's run.
+ *
+ * The model handoff is the preferred compaction, not the only one: when the
+ * summarizer errors, returns malformed arguments, or cannot be sized, the
+ * mechanical pass (`compactHistoryNow` — no model call) takes over, exactly
+ * as it ran before model compaction existed. If that also cannot shrink the
+ * history, the history is left untouched and the caller's over-budget guard
+ * decides. Only a cancellation propagates.
+ */
+export async function compactWithModelOrFallback(
+  params: Parameters<typeof compactWithModel>[0] & {
+    logger: Logger
+    runId?: string
+    model?: string
+    trigger?: string
+    /**
+     * Where the mechanical fallback should aim, below `maxContextLength`. That
+     * pass fills whatever budget it is given, so aimed at the hard budget it
+     * lands above an automatic trigger's threshold and the very next step
+     * compacts again. Falls back to `maxContextLength` when the target is too
+     * small to hold the live request.
+     */
+    fallbackTargetTokens?: number
+  },
+): Promise<{
+  messages: Message[]
+  summary: string
+  preTokens: number
+  postTokens: number
+  fallback?: true
+} | null> {
+  const {
+    logger,
+    runId,
+    model,
+    trigger,
+    fallbackTargetTokens,
+    ...modelParams
+  } = params
+  try {
+    return await compactWithModel(modelParams)
+  } catch (error) {
+    if (params.signal.aborted || isAbortError(error)) throw error
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    let fallback: ReturnType<typeof compactHistoryNow> = null
+    let fallbackError: string | undefined
+    const mechanical = (maxContextLength: number) =>
+      compactHistoryNow({
+        messages: params.messages,
+        maxContextLength,
+        fixedTokenCount: params.fixedTokenCount,
+        logger,
+        runId,
+      })
+    try {
+      if (
+        fallbackTargetTokens !== undefined &&
+        fallbackTargetTokens < params.maxContextLength
+      ) {
+        try {
+          fallback = mechanical(fallbackTargetTokens)
+        } catch {
+          // The live request does not fit the target; use the whole budget.
+        }
+      }
+      fallback ??= mechanical(params.maxContextLength)
+    } catch (mechanicalError) {
+      fallbackError =
+        mechanicalError instanceof Error
+          ? mechanicalError.message
+          : String(mechanicalError)
+    }
+    try {
+      logger.warn(
+        {
+          axiomEvent: MODEL_COMPACTION_FALLBACK_EVENT,
+          agent_run_id: runId,
+          model,
+          trigger_reason: trigger,
+          error_kind: compactionErrorKind(error),
+          error_name: error instanceof Error ? error.name : typeof error,
+          fallback_applied: Boolean(fallback),
+          fallback_failed: fallbackError !== undefined,
+          // Not allowlisted for Axiom; local/debug logs only.
+          error: errorMessage,
+          ...(fallbackError ? { fallback_error: fallbackError } : {}),
+        },
+        fallback
+          ? 'Model compaction failed; used mechanical compaction'
+          : 'Model compaction failed; history left unchanged',
+      )
+    } catch {
+      // Logging must never turn a recovered compaction into a failed run.
+    }
+    if (!fallback) return null
+    return {
+      messages: fallback.messages,
+      summary: fallback.summaryText,
+      preTokens: fallback.previousTokens + params.fixedTokenCount,
+      postTokens: fallback.nextTokens + params.fixedTokenCount,
+      fallback: true,
+    }
+  }
+}

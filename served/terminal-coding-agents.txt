@@ -1,0 +1,943 @@
+================================================================================
+TERMINAL CODING AGENTS
+A complete guide to the CLI coding-agent class of software
+================================================================================
+
+This document explains the category of tool, not any single product. No vendor
+names, no install commands for a specific package. If you understand everything
+here, you understand what every tool in this category is doing and why.
+
+Contents
+  1.  What this is
+  2.  What it is not
+  3.  Why the terminal
+  4.  The core loop
+  5.  Anatomy of the system
+  6.  Function-by-function breakdown
+  7.  How the model talks back: tool calling
+  8.  Context management (the real hard problem)
+  9.  Subagents and orchestration
+  10. The terminal UI layer
+  11. Permissions, trust, and safety
+  12. Configuration and repository context files
+  13. Sessions, persistence, and resumption
+  14. Distribution: how these tools reach your machine
+  15. The hosted-backend question
+  16. Cost models
+  17. Failure modes and how to spot them
+  18. How to evaluate one
+  19. Glossary
+
+
+--------------------------------------------------------------------------------
+1. WHAT THIS IS
+--------------------------------------------------------------------------------
+
+A terminal coding agent is a program that runs in your shell, accepts a request
+in natural language, and then edits files in your repository to satisfy that
+request. You type something like "add input validation to the signup handler".
+It reads files, decides what to change, writes changes, runs commands to check
+its work, reads the output, and iterates until the task is done or it gives up.
+
+The defining property is not that it uses a language model. Lots of tools do.
+The defining property is that it runs a LOOP with WRITE ACCESS and FEEDBACK:
+
+    model proposes an action -> action executes -> result is observed ->
+    model proposes the next action -> ...
+
+That loop, not the model, is what separates an agent from an autocomplete tool.
+The model supplies judgment; the harness supplies hands, eyes, memory, and
+guardrails.
+
+Key characteristics that define the class:
+
+  - Runs in a terminal, on your machine, against your local checkout.
+  - Takes natural-language instructions, not structured commands.
+  - Reads and writes real files on disk.
+  - Executes shell commands and reads their output.
+  - Operates autonomously across multiple steps without per-step prompting.
+  - Maintains a conversation/session that can span many turns.
+  - Is interruptible: you can stop it, correct it, and let it continue.
+
+The mental model that works best: an extremely fast, extremely literal junior
+engineer who has read a lot of code but has never seen YOUR code, cannot
+remember anything from yesterday, and will confidently do exactly what it
+thinks you asked rather than what you meant.
+
+
+--------------------------------------------------------------------------------
+2. WHAT IT IS NOT
+--------------------------------------------------------------------------------
+
+Worth stating plainly, because marketing blurs all of these:
+
+  - Not an IDE. It has no editor, no gutter, no debugger UI. It is a process
+    in a shell. Some have companion IDE plugins; the core is not one.
+
+  - Not a chat interface. A chatbot answers questions. An agent takes actions.
+    The difference is the tool-calling loop and disk access.
+
+  - Not a linter, formatter, or static analyzer. Those are deterministic
+    programs. An agent is a probabilistic planner that MAY invoke deterministic
+    programs (linters, tests, compilers) as tools.
+
+  - Not a search engine for code. Though "find the relevant files" is one of
+    its most-used internal capabilities, retrieval is a means, not the product.
+
+  - Not autonomous in the background sense. Most run in the foreground, driven
+    by you, in your terminal. Some support headless mode for CI, which is a
+    different deployment shape (see section 12).
+
+  - Not magic, and not reliable. It fails regularly and silently. Section 17
+    covers the failure modes; section 18 covers how to test for them.
+
+
+--------------------------------------------------------------------------------
+3. WHY THE TERMINAL
+--------------------------------------------------------------------------------
+
+Choosing a terminal as the interface is not nostalgia. It has concrete
+advantages and concrete costs.
+
+Advantages:
+
+  - The repository is already there. Your working tree, branches, uncommitted
+    changes, and git history are all local. No upload, no sync, no staleness.
+
+  - The shell is the integration point. Build systems, test runners, package
+    managers, cloud CLIs, database clients, docker -- everything a developer
+    already uses is reachable as a subprocess. An agent that can run commands
+    inherits the entire existing toolchain for free.
+
+  - Composability. It is a process. It can be scripted, run in CI, driven by
+    tmux, wrapped in other programs, and piped to and from other tools.
+
+  - No upload of proprietary code to a third party's editor backend, in the
+    configurations where the model runs against a local or self-hosted endpoint.
+
+  - Editor independence. Works in any terminal: a bare shell, an embedded
+    terminal in any editor, over SSH, in a container.
+
+Costs, and they are real:
+
+  - No visual diff. You get text, not a side-by-side. Reviewing large changes
+    is genuinely worse than in an editor.
+
+  - Text-only output. Explaining a layout bug or a chart is awkward.
+
+  - Discoverability. TUI keybindings are not self-evident. These tools live and
+    die on how good their keyboard UX is.
+
+  - The TUI is a considerable engineering burden. Full-screen terminal apps
+    must hand-roll rendering, input handling, and resize logic. This is why so
+    much of the source tree of any mature tool in this class is UI code.
+
+
+--------------------------------------------------------------------------------
+4. THE CORE LOOP
+--------------------------------------------------------------------------------
+
+Strip away the UI and this is the whole machine:
+
+  1. BUILD CONTEXT
+     Gather what the model needs to see: the user's request, conversation
+     history, the repository's instruction files, a map of the codebase, and
+     the contents of files judged relevant.
+
+  2. PROMPT
+     Send that context plus a description of the available tools to a language
+     model.
+
+  3. PARSE THE RESPONSE
+     The model returns either prose (it wants to talk to you) or a tool call
+     (it wants to act). Tool calls are structured: a name, plus arguments.
+
+  4. DISPATCH THE TOOL
+     Execute the requested action: read a file, write a file, apply a patch,
+     run a command, search the code, spawn a subagent.
+
+  5. OBSERVE
+     Capture the result. File contents, command stdout and stderr, exit code,
+     truncation notices.
+
+  6. APPEND AND REPEAT
+     Add the result to the conversation as a new message and go back to step 2.
+
+  7. TERMINATE
+     Stop when the model emits no tool calls, or a step budget is exhausted,
+     or the user interrupts, or an error threshold is crossed.
+
+Everything else in a real implementation is making each of those seven steps
+survivable: cheaper, faster, safer, more accurate, or more auditable.
+
+Two design decisions dominate quality:
+
+  - How much context you build in step 1 (too little: it edits the wrong file.
+    Too much: it is slow, expensive, and confused).
+  - How aggressively you allow step 4 to mutate the world (too cautious: it
+    asks permission constantly and is useless. Too permissive: it deletes
+    things you needed).
+
+Almost every meaningful difference between tools in this class is a different
+answer to those two questions.
+
+
+--------------------------------------------------------------------------------
+5. ANATOMY OF THE SYSTEM
+--------------------------------------------------------------------------------
+
+A mature terminal coding agent decomposes into layers. Names differ between
+projects; responsibilities do not.
+
+  ENTRY / LAUNCHER
+    The executable that starts everything: argument parsing, environment
+    validation, pre-flight checks, then handoff to the UI.
+
+  TUI LAYER (terminal user interface)
+    Full-screen interactive rendering. Layout, colors, scrolling, keyboard
+    handling, mouse handling, resize, and terminal-capability negotiation.
+
+  SESSION / STATE STORE
+    The conversation, the current task, pending approvals, mode flags, and the
+    list of files touched. Usually a central observable store that the UI
+    subscribes to.
+
+  AGENT RUNTIME
+    The loop from section 4. Owns the step budget, decides when to call the
+    model, and routes tool calls to implementations.
+
+  TOOL IMPLEMENTATIONS
+    The actual capabilities: read, write, patch, search, execute, fetch. The
+    part that touches your disk and your shell.
+
+  CONTEXT BUILDER
+    Selects and packs what the model sees. Includes repository instruction
+    files, a code map, retrieved files, and history compaction.
+
+  MODEL / PROVIDER ADAPTER
+    Abstracts over model providers. Normalizes request and response shapes,
+    handles streaming, retries, rate limits, and provider-specific quirks.
+
+  PERSISTENCE
+    Where sessions, credentials, settings, and caches live on disk.
+
+  TELEMETRY / LOGGING
+    Structured logs for debugging, plus optional usage analytics.
+
+  UPDATE MECHANISM
+    How the tool keeps itself current (see section 14).
+
+In a typical monorepo you will find these as separate packages rather than
+folders: a CLI package, an SDK package, a shared-types package, a code-parsing
+package, a provider-shims package, an agent-runtime package. The split is not
+cosmetic. It exists because the same agent runtime is reused across surfaces
+(terminal, desktop, web, CI), and the shared packages are what make that
+possible without forking the logic.
+
+
+--------------------------------------------------------------------------------
+6. FUNCTION-BY-FUNCTION BREAKDOWN
+--------------------------------------------------------------------------------
+
+This is what these tools actually do, capability by capability.
+
+----------------------------------------
+6.1 CODEBASE ORIENTATION
+----------------------------------------
+Purpose: figure out which files matter before touching anything.
+
+  - Whole-repo inventory: a fast walk respecting ignore rules (the same
+    .gitignore-style patterns git uses, plus tool-specific ignore files).
+  - Structural map: parse source files into a symbol-level outline (functions,
+    classes, types) WITHOUT loading entire file bodies. This is the single
+    biggest cost saver -- it lets the model see the shape of a large codebase
+    for a fraction of the tokens of reading it.
+  - File-finding retrieval: given a natural-language request, rank files by
+    likely relevance using names, paths, structure, and optional embeddings.
+  - Convention discovery: locate instruction files, manifest files, and test
+    layout so generated code matches house style.
+
+----------------------------------------
+6.2 READING
+----------------------------------------
+  - Read whole file.
+  - Read a line range (essential for large files; models get lost in 5000-line
+    files).
+  - Read many files in one action.
+  - Follow imports/references to gather a connected set of files.
+  - List directories and inspect metadata (size, modified time, permissions).
+
+----------------------------------------
+6.3 WRITING
+----------------------------------------
+Three distinct mechanisms, and the distinction matters:
+
+  - Full-file write. Simple, robust for new files, dangerous for existing ones:
+    a single hallucinated omission silently deletes unrelated code.
+
+  - Targeted patch / diff application. The preferred mechanism. The model emits
+    a structured edit (often a unified-diff-like hunk, sometimes an explicit
+    old-text/new-text pair). The harness locates the anchor text and applies the
+    change. This is safer, reviewable, and cheap in tokens. Its characteristic
+    failure is a stale anchor: the file changed, the anchor no longer matches,
+    and the edit is rejected. Good tools surface that error and let the model
+    re-read and retry.
+
+  - Line-oriented insertion/deletion. Used for surgical changes where a patch
+    anchor is awkward.
+
+Around all of these: atomicity (write to temp, then move, so a crash cannot
+leave a half-written file), and usually an undo path via git.
+
+----------------------------------------
+6.4 SEARCH
+----------------------------------------
+  - Regex/text search over the tree (typically backed by a fast native grep
+    implementation, not a JavaScript loop).
+  - Symbol search when the code is parsed rather than merely grepped.
+  - Glob/filename search.
+  - Semantic or fuzzy search in tools that index embeddings.
+  - "Find usages" style traversal via the structural layer.
+
+----------------------------------------
+6.5 EXECUTION
+----------------------------------------
+  - Run a shell command, capture stdout, stderr, and exit code.
+  - Run tests, parse the output, and feed failures back into the loop. This is
+    the highest-value tool in the entire set, because it converts "the model
+    thinks this is correct" into "the machine verified this is correct".
+  - Run builds, linters, formatters, type-checkers.
+  - Long-running processes handled specially (background, or streamed, or
+    explicitly forbidden -- an interactive command that waits for stdin will
+    hang the agent forever unless the harness prevents it).
+  - Output truncation with a visible marker, so the model knows it is seeing a
+    partial view rather than the whole truth.
+
+----------------------------------------
+6.6 INTERNET / EXTERNAL TOOLS
+----------------------------------------
+  - Web fetch and search, for library docs and error messages.
+  - API calls, for issue trackers or internal services.
+  - MCP (Model Context Protocol) integration: a standard way to attach
+    arbitrary external capabilities as tools. This is how modern tools avoid
+    hardcoding every possible integration.
+
+----------------------------------------
+6.7 VERSION CONTROL
+----------------------------------------
+  - Inspect status, diff, log, and blame.
+  - Create branches and commits.
+  - Generate a commit message from the change.
+  - Sometimes open a pull request via the provider's API.
+  - Read history to understand why code looks the way it does.
+
+----------------------------------------
+6.8 TASK-LEVEL FEATURES
+----------------------------------------
+  - Plan mode: produce a plan for approval before any edits. Extremely valuable
+    for large or ambiguous work, since it surfaces misunderstanding early and
+    cheaply.
+  - Mode switching: a read-only "explain/answer" mode versus a write-capable
+    "implement" mode. Restricting the toolset by mode is a cheap, effective
+    safety measure.
+  - Subagent spawning: delegate a slice of work to a fresh context (section 9).
+  - Context compaction: summarize old history when it grows too long.
+  - Session resumption: pick up a previous conversation (section 13).
+
+
+--------------------------------------------------------------------------------
+7. HOW THE MODEL TALKS BACK: TOOL CALLING
+--------------------------------------------------------------------------------
+
+The mechanism has three moving parts and it is worth understanding all three.
+
+  1. THE SCHEMA
+     Each capability is described to the model as a name, a purpose, and a
+     typed parameter list. This description IS the interface. A vague
+     description produces wrong calls; this is why tool descriptions in these
+     codebases are long, precise, and heavily commented.
+
+  2. THE CALL
+     The model emits a structured request rather than prose. It may emit
+     several calls at once (parallel tool calls) when they are independent.
+
+  3. THE RESULT
+     The harness executes and returns text. The model reads it and continues.
+
+Consequences that shape every implementation:
+
+  - Tool errors are normal, not exceptional. A bad call is simply a message in
+    the conversation, and the model is expected to recover. Harnesses therefore
+    spend real effort on making errors informative: "the anchor text was not
+    found; the file has changed since you last read it; here are the nearby
+    lines" beats "Error: patch failed".
+
+  - Truncation must be explicit. Silent truncation teaches the model a false
+    picture of the file, and it will confidently reason from the missing part.
+
+  - The schema is a security boundary. Every argument is untrusted input from
+    a probabilistic source. Paths must be validated. Commands must be bounded.
+
+  - Description quality is a feature. Much of the perceived intelligence of a
+    coding agent comes from careful tool design rather than model choice.
+
+
+--------------------------------------------------------------------------------
+8. CONTEXT MANAGEMENT (THE REAL HARD PROBLEM)
+--------------------------------------------------------------------------------
+
+This is where tools actually differ, and where most quality is won or lost.
+
+The constraint: a model has a finite context window. A repository does not fit
+in one, and even when it technically does, filling the window with raw files
+produces worse answers and higher cost than a smaller, better-chosen set.
+
+The techniques:
+
+  - LAYERED DISCLOSURE. Give the model a cheap structural map first. Let it
+    request specific files. Never dump the repo.
+
+  - RELEVANCE RETRIEVAL. Rank files against the request using path, name,
+    structure, recency, and (optionally) embedding similarity. Return a
+    shortlist, not everything.
+
+  - HISTORY COMPACTION. As a session grows, older turns are summarized and the
+    verbose tool output is dropped. Usually triggered by a token threshold.
+    Done badly, this is how an agent "forgets" a constraint you gave it forty
+    turns ago -- a very common and very confusing failure.
+
+  - SELECTIVE FILE RE-READING. After an edit, the harness must decide whether
+    the model needs to re-read the file or can assume the edit applied. Getting
+    this wrong causes the model to reason from a stale picture.
+
+  - DEDUPLICATION. The same file pulled in five ways must appear once.
+
+  - PROMPT CACHING. Providers can cache a stable prefix of the prompt. Caching
+    interacts directly with compaction: an aggressive compaction invalidates the
+    cache and silently multiplies your cost. Mature tools order and structure
+    prompts specifically to keep cache hits high.
+
+  - SUMMARIZED SUBAGENT RESULTS. A subagent may read fifty files and return
+    three sentences. The parent context pays only for the summary.
+
+The trade-off to internalize: context is not free and more is not better. The
+failure mode of too much context looks exactly like the failure mode of too
+little -- a confidently wrong edit. It just costs more.
+
+
+--------------------------------------------------------------------------------
+9. SUBAGENTS AND ORCHESTRATION
+--------------------------------------------------------------------------------
+
+A subagent is a fresh agent instance with its own context window and its own
+restricted toolset, invoked by the main agent as if it were a tool.
+
+Why this exists -- three distinct problems:
+
+  - CONTEXT ISOLATION. Searching a large codebase may require reading dozens of
+    files. Doing that in the main conversation permanently bloats it. A
+    subagent burns its own window and returns a compact answer.
+
+  - SPECIALIZATION. A different prompt and a smaller toolset suit a narrower
+    job. A research subagent should not have write access. A reviewer should
+    not have the ability to "fix" what it reviews.
+
+  - PARALLELISM. Independent investigations run concurrently.
+
+Typical roles in these systems:
+
+  - Explorer / file-finder: locate relevant code, return paths and summaries.
+  - Reviewer: critique a diff against requirements and conventions.
+  - Researcher: consult external documentation.
+  - Planner: decompose a task into steps.
+  - Browser driver: exercise a web UI to verify behavior.
+  - Verifier / test-runner: run the suite and report failures.
+
+The main agent's job becomes orchestration: decide which subagent to consult,
+in what order, and how to merge the answers. This is why subagent design is
+where architectural sophistication lives, and why "nine subagents" style
+marketing claims are describing an architecture, not a feature count.
+
+The failure mode: orchestration overhead. A subagent that returns a vague
+summary, or contradicts a sibling, produces worse results than no subagent at
+all. Delegation is only worth it when the sub-result is genuinely compressible.
+
+
+--------------------------------------------------------------------------------
+10. THE TERMINAL UI LAYER
+--------------------------------------------------------------------------------
+
+Deceptively large. Expect a substantial fraction of any such codebase to be
+rendering and input code, for reasons that are structural rather than lazy.
+
+What the TUI must handle:
+
+  - RENDERING. No DOM, no layout engine by default. Either hand-rolled cell
+    buffers or a framework (several purpose-built ones exist for terminal
+    React-style rendering). Must handle wide characters, emoji, and combining
+    marks, which are genuinely hard because terminal width is not character
+    count.
+
+  - INPUT. Raw mode keystroke handling. Distinguishing a typed character from a
+    control sequence. Multi-key chords. Paste detection (a paste arrives as a
+    flood of keystrokes and will trigger every keybinding unless bracketed paste
+    is supported).
+
+  - TERMINAL CAPABILITY NEGOTIATION. Terminals differ wildly: color depth,
+    mouse reporting, alternate-screen support, keyboard protocols. The tool
+    must detect capabilities and degrade gracefully.
+
+  - TERMINAL STATE RESTORATION. A full-screen app enters an alternate screen,
+    enables raw mode, may enable mouse and focus reporting, and hides the
+    cursor. If the process dies badly -- crash, force-kill -- none of that is
+    undone, and the user's terminal is left mangled. Robust tools reset this
+    state from a supervising process that survives the crash. This is a real,
+    recurring bug class and a good indicator of implementation maturity.
+
+  - STREAMING DISPLAY. Model output arrives token by token. The UI must render
+    partial text smoothly and fold it into final text without flicker.
+
+  - DIFF PRESENTATION. Showing proposed edits legibly in a text-only medium,
+    with enough context to judge, is a genuine design problem.
+
+  - SCROLLING AND LAYOUT. Varying content in a fixed-size window, reflowing on
+    resize.
+
+Common UX patterns across the category:
+
+  - A prompt line where you type the request.
+  - A running transcript of actions taken, with tool calls visibly distinct
+    from model prose.
+  - Explicit indicators for reading, editing, and running commands, so you can
+    tell at a glance what it is touching.
+  - Inline approval prompts for risky actions.
+  - Slash commands for control (mode switches, session management, settings).
+  - Mode indicators (plan vs. act, cheap model vs. strong model).
+
+
+--------------------------------------------------------------------------------
+11. PERMISSIONS, TRUST, AND SAFETY
+--------------------------------------------------------------------------------
+
+An agent with write and execute access is, operationally, you with a keyboard.
+Treat it as a security-relevant actor.
+
+Threat surface:
+
+  - DESTRUCTIVE FILE OPERATIONS. Deletions, overwrites, force-pushes,
+    migrations against a real database.
+
+  - COMMAND EXECUTION. Anything you could run, it can run. Including anything
+    malicious in a repository it is pointed at.
+
+  - PROMPT INJECTION. This is the subtle one. If the agent reads content that
+    contains instructions -- a README, an issue body, a code comment, a
+    dependency's docs, a fetched web page -- a model may follow those
+    instructions as if you had given them. An attacker who can get text into
+    any file the agent reads can attempt to steer it. Defenses are incomplete
+    by nature; the practical mitigations are restricting tools, requiring
+    approval for sensitive actions, and never letting an agent run
+    unattended with credentials it does not need.
+
+  - SECRETS. An agent reading broadly will encounter credential files and
+    environment dumps. Robust tools block reads of known secret paths and stop
+    secrets from being sent to a provider.
+
+  - CREDENTIAL-BEARING OUTBOUND CALLS. Whatever endpoint the agent is
+    configured to talk to receives both your code and your prompt history.
+    Changing that endpoint changes who sees your source. Some tools guard this
+    specifically: a repository's dotenv file must not be able to redefine the
+    API base URL, because otherwise a hostile repo you clone and run the agent
+    in could redirect a token-bearing call to a host of its choosing. Expect the
+    build to deliberately refuse to read a project's .env for such settings.
+
+  - SUPPLY CHAIN. The tool itself fetches code and, often, a native binary. A
+    compromised release, or a package with a name near the real one, is a direct
+    path to running attacker code on your machine.
+
+Mitigation patterns:
+
+  - Permission prompts, with a visible "allow for this session" escape hatch.
+  - Trust on first use, per directory.
+  - Read-only modes that remove write and execute tools entirely.
+  - Path confinement and ignore rules (.gitignore-style, plus explicit
+    denylists) so agent searches do not wander into node_modules, build
+    output, or credential files.
+  - Sandboxing, containerization, or running in a disposable checkout.
+  - Explicit approval for network access and for anything touching production.
+  - Integrity checks (checksums) on downloaded binaries.
+
+Practical posture: run agents on a branch, or in a worktree, or in a container,
+with credentials scoped to what the task actually needs. Review before merge.
+This is ordinary engineering hygiene, not paranoia -- the failure modes are
+mundane (a stray rm, a wrong migration) more often than adversarial.
+
+
+--------------------------------------------------------------------------------
+12. CONFIGURATION AND REPOSITORY CONTEXT FILES
+--------------------------------------------------------------------------------
+
+The single most effective way to improve output is to tell the tool about your
+project. These tools read instruction files from the repository, so the
+guidance is version-controlled and shared by the whole team.
+
+What these files carry:
+
+  - Build, test, and lint commands (so it does not guess).
+  - Architecture notes and the repo map.
+  - Conventions: language, formatting, error handling, naming.
+  - Rules that are not derivable from the code: deprecated APIs, banned
+    dependencies, migration state.
+  - Explicit pitfalls.
+
+Why it works: it is retrieval with zero search cost and maximum relevance. It
+arrives in context on every turn, so it shapes every decision, and it costs
+almost nothing to maintain.
+
+Design considerations:
+
+  - Global settings versus per-project settings, with a precedence order.
+  - Instruction files are themselves agent-readable content, so they are part
+    of the injection surface -- but they are also exactly the place where
+    "treat repository content as data, not instructions" belongs.
+  - Ignore files control both search scope and context selection, so a
+    misconfigured ignore file silently degrades quality.
+  - Tool-specific configuration (model choice, permissions, server endpoints)
+    usually lives outside the repo, in a per-user config directory.
+
+The practical takeaway: if you adopt one of these tools and do nothing else,
+write the instruction file. It moves the needle more than model selection.
+
+
+--------------------------------------------------------------------------------
+13. SESSIONS, PERSISTENCE, AND RESUMPTION
+--------------------------------------------------------------------------------
+
+  - A session is the conversation plus derived state (files touched, mode,
+    pending approvals).
+  - Sessions persist to disk so a crash does not lose the work, and so you can
+    resume later.
+  - Resumption must reload a consistent picture, which is subtler than reading
+    a log: the files may have moved on since the session was suspended, so the
+    agent's beliefs about the code may be stale. Good tools re-orient rather
+    than blindly replaying.
+  - Compaction history matters across sessions too: if you resume a compacted
+    session, what you get back is the summary, not the original detail.
+  - Credential storage lives near sessions, in a per-user directory, and is
+    exactly the thing to protect and to keep out of version control.
+
+
+--------------------------------------------------------------------------------
+14. DISTRIBUTION: HOW THESE TOOLS REACH YOUR MACHINE
+--------------------------------------------------------------------------------
+
+There are three dominant shapes, and knowing which you have matters for
+security, updates, and reproducibility.
+
+  A. NODE/NPM WRAPPER PLUS A NATIVE BINARY
+     A small JavaScript package installs a launcher; the launcher downloads a
+     precompiled native executable specific to your operating system and CPU
+     architecture, and execs it. The package is a delivery mechanism, not the
+     program. Consequences:
+       - The package contents are tiny. Reading the source to learn how the
+         agent works yields nothing -- the agent is in the binary.
+       - The install performs network access, often via a postinstall script.
+       - Platform variants exist for architecture and for instruction-set level
+         (an optimized build and a lower-common-denominator "baseline" build);
+         the launcher may retry with the baseline if the optimized one crashes
+         with an unsupported-instruction fault.
+       - Update checks, integrity checksums, and download retry/resume logic
+         live in the launcher.
+
+  B. A SINGLE COMPILED EXECUTABLE
+     One self-contained file per platform, no runtime dependency. Often shipped
+     via a package manager or a release page. Simplest to run, hardest to
+     inspect.
+
+  C. INTERPRETED SOURCE
+     The tool is JS/TS/Python/Rust distributed as source, run by a runtime. Most
+     installable and auditable, heaviest dependency footprint.
+
+Update models:
+
+  - Self-update: the tool checks for a newer version and may stage it, applying
+    on next launch or on exit. Deferring until exit matters for long-lived
+    sessions -- replacing the binary mid-session is not safe.
+  - Package manager: update by reinstalling.
+  - Pinned: you choose the version, which is what you want in CI.
+
+Two practical notes:
+
+  - For distribution shape A, the published package version and the downloaded
+    binary version can be reported differently, and the package metadata
+    usually carries per-platform checksums for the binary it will fetch.
+  - If your environment blocks network access at install time, shape A fails
+    even though it looks like a trivial dependency. Do not assume a package
+    that installs cleanly in one environment installs in a locked-down one.
+
+When evaluating provenance, check: who publishes it, whether builds are
+attested, whether checksums are enforced on download, and whether the binary
+download is restricted to a secure origin. These are the questions that matter,
+far more than the README's feature list.
+
+
+--------------------------------------------------------------------------------
+15. THE HOSTED-BACKEND QUESTION
+--------------------------------------------------------------------------------
+
+Almost every tool in this class looks local and is not entirely local. Be clear
+about where the boundary is.
+
+Typical split:
+
+  - LOCAL: the loop, the file tools, the shell, the git operations, the TUI,
+    session storage.
+  - REMOTE: the language model itself, and often authentication, model
+    selection, usage metering, and any proprietary retrieval or ranking.
+
+Implications:
+
+  - Your code leaves the machine. Which files, how much, and under what
+    retention policy, depends entirely on the configuration. Some tools send
+    broad context; some minimize it.
+  - Offline operation is usually impossible in the default configuration,
+    because the model is remote.
+  - The client can be fully open while the service is proprietary. This is a
+    common and legitimate split: the agent loop is auditable, the model access
+    is a service. Do not mistake an open client for an end-to-end open system.
+  - "Free" tools in this class are usually free-at-the-point-of-use, funded by
+    something else: advertising, upsell to a paid tier, data use terms, or a
+    research agenda. Read the data-use terms as carefully as you read the
+    license. The license governs the code; the terms govern your code.
+  - Bring-your-own-key configurations move the billing and the data handling to
+    a provider you chose, which is often the more auditable arrangement.
+
+The configuration to know: whatever environment variable or setting points the
+client at a backend URL. That single value decides where your source code goes.
+
+
+--------------------------------------------------------------------------------
+16. COST MODELS
+--------------------------------------------------------------------------------
+
+Three axes, and they interact.
+
+  - SUBSCRIPTION: flat fee, metered by usage limits. Predictable, capped.
+  - PAY-PER-TOKEN: variable. Cost tracks context size times turns, so the
+    cheap-seeming agent that reads forty files per turn costs far more than the
+    one that reads four.
+  - FREE TIER: no marginal cost, offset by the limits, the data terms, or the
+    advertising described above. Usually rate-limited, region-limited, or
+    model-limited.
+
+What actually drives cost, in order of leverage:
+
+  1. Context size per turn (dominated by retrieval quality -- see section 8).
+  2. Number of turns (dominated by how often the agent flails).
+  3. Model choice per step. Strong models for planning, cheap models for
+     mechanical edits and file-finding, is the standard optimization.
+  4. Prompt-cache hit rate. A stable prefix is dramatically cheaper than a
+     changing one.
+  5. Output tokens -- usually a small fraction of input.
+
+Practical guidance: the cheapest agent is the one with good retrieval and a
+tight loop. Cost is usually a symptom of a context problem, not a pricing
+problem. In CI, always pin a version and set an explicit step/token budget,
+because a looping agent in a pipeline is an unbounded bill.
+
+
+--------------------------------------------------------------------------------
+17. FAILURE MODES AND HOW TO SPOT THEM
+--------------------------------------------------------------------------------
+
+Learn these. Recognizing them is most of the skill of using these tools well.
+
+  - THE EDIT THAT DID NOT APPLY. A patch anchor no longer matches; the tool
+    reports success anyway, or the model assumes success without checking. Always
+    inspect the resulting diff.
+
+  - THE CONFIDENT HALLUCINATION. It references a function or file that does not
+    exist, often plausibly. Symptom: code that looks right and does not compile.
+
+  - CONTEXT AMNESIA. A constraint you stated early is dropped after compaction.
+    Symptom: it reintroduces the exact pattern you banned, late in a long
+    session. Fix: restate constraints, or put them in the instruction file where
+    they are re-sent every time.
+
+  - THE FLATTERING REVIEW. Asked to review, it says the code is good. This is
+    the default failure of reviewer subagents; it is why requirements-anchored
+    review prompts matter.
+
+  - SCOPE CREEP. Asked for one thing, it refactors three others. Symptom: a diff
+    far larger than the request. Guard: plan mode, and a tight instruction file.
+
+  - THE SILENT REGRESSION. It deletes a line it did not understand because the
+    line looked redundant. Always run the tests.
+
+  - STALE PICTURE. It reasons about a file using a copy it read before an
+    external change. Symptom: edits that target code that has moved.
+
+  - THE RUNAWAY LOOP. It retries the same failing action. Symptom: cost climbing,
+    no progress. Guard: step budgets and visible tool-call traces.
+
+  - THE HUNG COMMAND. It launched something interactive and is waiting forever.
+    Guard: timeouts and non-interactive execution.
+
+  - OVER-TRUSTING THE SUMMARY. A subagent reported "no issues found" and the
+    main agent accepted it. Symptom: confident completion with real problems.
+
+  - SECRET LEAKAGE. It read a credential file and sent it upstream. Guard:
+    denylists and path confinement.
+
+A note on attribution: when one of these happens, resist blaming the model. In
+practice the harness -- retrieval, tool design, error messages, compaction --
+causes most failures. The model is the visible surface of a system.
+
+
+--------------------------------------------------------------------------------
+18. HOW TO EVALUATE ONE
+--------------------------------------------------------------------------------
+
+A practical checklist that tests the system rather than the demo.
+
+  1. ORIENTATION. Ask it to explain a non-obvious part of a real codebase.
+     Correctness here tests retrieval, and retrieval is the foundation.
+
+  2. SMALL PRECISE EDIT. Ask for a one-line change in a specific file. Verify
+     the diff is exactly that, and nothing else. Tests targeting and restraint.
+
+  3. CROSS-FILE CHANGE. Ask for a change that requires finding all callers.
+     Tests search and structural understanding.
+
+  4. TEST-DRIVEN LOOP. Ask it to make a failing test pass. Watch whether it
+     actually reads the failure and iterates, or flails. This is the single most
+     informative test.
+
+  5. LARGE REFACTOR. Tests plan mode, context management, and whether it holds
+     a coherent plan over many steps.
+
+  6. AMBIGUOUS REQUEST. Ask for something underspecified. A good tool asks;
+     a bad one guesses and produces a large wrong diff.
+
+  7. ADVERSARIAL REPO. A repo with a hostile instruction in a README or a
+     comment. Does it treat content as data, or obey it?
+
+  8. UNFAMILIAR STACK. A language or framework it cannot have memorized well.
+     Tests whether it reads and respects the actual code versus pattern-matching
+     from training.
+
+  9. FAILURE BEHAVIOR. Give it a genuinely impossible task. Does it stop and say
+     so, or loop and burn budget? Graceful failure is a strong quality signal.
+
+  10. RESOURCE BEHAVIOR. Watch latency, token usage, and how much of your repo
+      it reads per turn. This predicts your bill.
+
+  11. RECOVERY. Interrupt it mid-task, then resume. Tests session integrity.
+
+  12. REPRODUCIBILITY. Run the same task twice. High variance means a brittle
+      system.
+
+Evaluation heuristics:
+
+  - Judge the diff, not the transcript. A confident explanation of a wrong change
+    is commonplace.
+  - Prefer deterministic verification (tests, type-checkers, linters) as the
+    acceptance criterion. Where you can mechanically check the result, the
+    agent's self-assessment is irrelevant.
+  - Measure restraint. The best diffs from these tools are usually the smallest.
+  - Test on your codebase, not on a toy. Everyone's demo works on a toy.
+
+
+--------------------------------------------------------------------------------
+19. GLOSSARY
+--------------------------------------------------------------------------------
+
+Agent
+  A system that runs a loop of model-proposed actions and observed results,
+  rather than producing a single answer.
+
+Agent runtime
+  The component that owns and executes that loop.
+
+Baseline build
+  A native binary compiled for older CPUs lacking newer instruction sets, used
+  as a fallback when the optimized build crashes.
+
+Code map
+  A structural outline of a codebase (symbols, files, relationships) that lets a
+  model understand a large tree without reading every file.
+
+Compaction
+  Summarizing and dropping older conversation history when the context window
+  fills.
+
+Context window
+  The finite amount of text a model can consider at once. The central constraint
+  of the entire field.
+
+Diff / patch
+  A structured description of a change. Preferred over full-file rewrites
+  because it is safer, cheaper, and reviewable.
+
+Headless mode
+  Running the agent without an interactive UI, typically in CI.
+
+MCP (Model Context Protocol)
+  A standard for attaching external tools and data sources to an agent without
+  bespoke integration code.
+
+Plan mode
+  A mode where the agent proposes an approach for approval before making any
+  edits.
+
+Prompt caching
+  Provider-side reuse of an unchanged prompt prefix to cut cost and latency.
+
+Prompt injection
+  Content the agent reads containing instructions that steer it, as distinct
+  from instructions from the user.
+
+Retrieval
+  Selecting which files and snippets to place in context. The highest-leverage
+  part of any implementation.
+
+Session
+  A persisted conversation and its associated state, resumable across launches.
+
+Subagent
+  A separate agent instance with its own context and restricted toolset,
+  invoked as a tool by the main agent.
+
+Tool / tool call
+  A capability exposed to the model (read, write, search, execute) and the
+  structured request to invoke it.
+
+TUI
+  Terminal user interface: full-screen interactive rendering in a terminal,
+  including input handling and capability negotiation.
+
+Worktree
+  A separate working directory checked out from the same repository, useful for
+  isolating an agent's changes from your main checkout.
+
+
+================================================================================
+CLOSING SUMMARY
+================================================================================
+
+A terminal coding agent is a loop. The model supplies judgment, and the harness
+supplies hands, eyes, memory, and guardrails. Everything that distinguishes one
+implementation from another reduces to four questions:
+
+  1. How does it decide what context to use?      (retrieval -- section 8)
+  2. What can it do, and how is that constrained? (tools and trust -- 6, 11)
+  3. How does it split work across subagents?     (orchestration -- section 9)
+  4. How does it verify its own work?             (feedback loop -- section 6.5)
+
+The tools that feel intelligent are the ones with good retrieval and a real
+verification loop. The model matters, but it matters less than the system built
+around it. And the practical rule that survives every change in this space:
+
+    judge the diff, and let the machine check the result.
+
+================================================================================

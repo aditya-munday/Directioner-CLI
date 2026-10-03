@@ -1,0 +1,7 @@
+[install]
+linker = "hoisted"
+linkWorkspacePackages = true
+
+[test]
+exclude = ["**/*.integration.test.*", "directioner/e2e/**"]
+preload = ["./sdk/test/setup-env.ts"]

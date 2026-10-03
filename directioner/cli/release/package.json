@@ -1,0 +1,44 @@
+{
+  "name": "directioner",
+  "version": "0.1.0",
+  "description": "BYOK-first terminal coding agent: bring your own model provider, no account and no backend.",
+  "license": "MIT",
+  "bin": {
+    "directioner": "index.js"
+  },
+  "files": [
+    "index.js",
+    "launcher.js",
+    "README.md",
+    "directioner",
+    "directioner.exe",
+    "tree-sitter.wasm"
+  ],
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aditya-munday/Directioner-CLI.git"
+  },
+  "keywords": [
+    "coding-agent",
+    "cli",
+    "byok",
+    "terminal",
+    "ai"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": false
+  }
+}

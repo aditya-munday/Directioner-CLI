@@ -1,0 +1,27 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@beyonders/common/*": ["./common/src/*"],
+      "@beyonders/evals/*": ["./evals/*"],
+      "@beyonders/sdk": ["./sdk/src/index.ts"],
+      "@beyonders/sdk/*": ["./sdk/*"],
+      "@beyonders/agent-runtime/*": ["./packages/agent-runtime/src/*"],
+      "@beyonders/llm-providers/*": ["./packages/llm-providers/src/*"],
+      "@beyonders/code-map/*": ["./packages/code-map/*"]
+    }
+  },
+  "files": [],
+  "references": [
+    { "path": "./common" },
+    { "path": "./agents" },
+    { "path": "./sdk" },
+    { "path": "./cli" },
+    { "path": "./evals" },
+    { "path": "./packages/agent-runtime" },
+    { "path": "./packages/code-map" },
+    { "path": "./packages/llm-providers" }
+  ]
+}

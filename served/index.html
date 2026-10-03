@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Directioner CLI — build &amp; deliverables</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #14171c;
+    --panel-2: #1b1f26;
+    --line: #262b33;
+    --ink: #e8eaed;
+    --muted: #9aa3af;
+    --accent: #7c5cff;
+    --accent-2: #35d0ba;
+    --warn: #f0b429;
+    --ok: #35d07f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 48px 22px 90px; }
+  header { border-bottom: 1px solid var(--line); padding-bottom: 26px; margin-bottom: 34px; }
+  .kicker {
+    display: inline-block; font-size: 12px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--accent-2); border: 1px solid var(--line); border-radius: 999px;
+    padding: 4px 12px; margin-bottom: 14px;
+  }
+  h1 { font-size: 34px; line-height: 1.15; margin: 0 0 10px; letter-spacing: -.02em; }
+  h2 { font-size: 20px; margin: 38px 0 12px; letter-spacing: -.01em; }
+  h3 { font-size: 15px; margin: 22px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+  p { color: var(--muted); }
+  a { color: var(--accent-2); }
+  code, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13.5px;
+  }
+  .dl {
+    display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--line); border-radius: 14px; padding: 20px; margin: 8px 0 6px;
+  }
+  .btn {
+    display: inline-block; background: var(--accent); color: #fff; text-decoration: none;
+    font-weight: 600; padding: 12px 20px; border-radius: 10px;
+  }
+  .btn.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+  .meta { color: var(--muted); font-size: 14px; }
+  table { width: 100%; border-collapse: collapse; margin: 10px 0 4px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); font-size: 14.5px; vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12.5px; text-transform: uppercase; letter-spacing: .07em; }
+  td.mono { font-size: 13px; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .pill.ok { background: rgba(53,208,127,.14); color: var(--ok); }
+  .pill.warn { background: rgba(240,180,41,.14); color: var(--warn); }
+  .note {
+    background: rgba(240,180,41,.07); border: 1px solid rgba(240,180,41,.3);
+    border-left: 3px solid var(--warn); border-radius: 8px; padding: 14px 16px; margin: 14px 0;
+  }
+  .note strong { color: var(--warn); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; }
+  ul { color: var(--muted); }
+  li { margin: 5px 0; }
+  footer { margin-top: 46px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <span class="kicker">Directioner CLI</span>
+    <h1>Beyonders → Directioner rebrand</h1>
+    <p>Source archive and build log for the terminal coding agent launched via <code>directioner</code>.</p>
+  </header>
+
+  <div class="dl">
+    <a class="btn" href="/directioner-cli.zip" download>Download source zip</a>
+    <a class="btn ghost" href="/PROGRESS.md" target="_blank" rel="noopener">Read PROGRESS.md</a>
+    <a class="btn ghost" href="/directioner-cli-reference.txt" target="_blank" rel="noopener">CLI reference</a>
+    <span class="meta">20.2 MB &middot; 1826 files &middot; excludes <code>node_modules</code>, <code>.git</code> and built binaries</span>
+  </div>
+  <p class="meta">After unzipping, run <code>bun install</code> to restore dependencies.</p>
+
+  <div class="note">
+    <strong>Maintenance rule.</strong> <code>PROGRESS.md</code> must be updated after
+    every prompt task is completed. Append a task-log entry, refresh the status
+    summary, and record new verification evidence. A task is not done until the
+    file reflects it.
+  </div>
+
+  <h2>What was done</h2>
+
+  <h3>Provider aliases</h3>
+  <table>
+    <tr><th>Alias</th><th>Upstream</th><th>Protocol</th><th>Verified</th></tr>
+    <tr><td class="mono">heital</td><td>Google Gemini</td><td class="mono">openai-compatible</td><td><span class="pill ok">OK</span></td></tr>
+    <tr><td class="mono">eternal</td><td>Anthropic Claude</td><td class="mono">anthropic (Messages API)</td><td><span class="pill ok">OK</span></td></tr>
+    <tr><td class="mono">infernal</td><td>Groq</td><td class="mono">openai-compatible</td><td><span class="pill ok">OK</span></td></tr>
+  </table>
+  <p>Eternal uses the native Anthropic provider because Claude's endpoint is not
+  OpenAI-compatible. Unknown provider ids are rejected.</p>
+
+  <h3>Advertising removed</h3>
+  <div class="card">
+    <ul>
+      <li><code>getAdsEnabled</code> returns false unconditionally.</li>
+      <li>The whole <code>ads:</code> command family is removed from <code>COMMAND_REGISTRY</code>, so a hand-typed command cannot reach a dead ad control.</li>
+      <li>Sponsored proposals, rotating cards, partner lines and inline response ads are gated off.</li>
+      <li>Settings default <code>adsEnabled</code> to false.</li>
+      <li>Ad/login egress paths (analytics, log shipper, ad requests) are disabled; PostHog is never constructed.</li>
+    </ul>
+  </div>
+
+  <h3>Other workstreams</h3>
+  <table>
+    <tr><th>Item</th><th>Detail</th></tr>
+    <tr><td>Rebrand</td><td>Binary <code>cli/bin/directioner</code>; config dir <code>~/.config/directioner</code> with <code>HOSTED_CONFIG_DIR</code> fallback.</td></tr>
+    <tr><td>Config validation</td><td>Missing config prints a setup template; broken config and missing key print actionable errors; unknown provider lists valid ids.</td></tr>
+    <tr><td>Egress guard</td><td><code>scripts/check-no-vendor-egress.ts</code> fails CI on Stripe / ZeroClick / Composio endpoints; passes for source and binary.</td></tr>
+    <tr><td>Tests</td><td>Directioner smoke test 4/4 pass; broader suite matches the pre-existing baseline. No regressions.</td></tr>
+    <tr><td>Typecheck</td><td><code>cli</code> typecheck clean (no drift errors).</td></tr>
+  </table>
+
+  <h2>Known caveats</h2>
+  <ul>
+    <li><code>node_modules</code> (810 MB) and built binaries (~281 MB) are excluded from the zip.</li>
+    <li>A ~79 MB eval file is present in git history, above GitHub's 50 MB soft limit. Consider Git LFS.</li>
+    <li>Ad modules still exist as unreachable code rather than being deleted.</li>
+    <li>PostHog remains in the bundle as an unused static import.</li>
+    <li>Original attribution is preserved in <code>LICENSE</code> / <code>NOTICE</code> as a legal requirement.</li>
+  </ul>
+
+  <footer>
+    Generated by an AI agent (OpenHands) on behalf of the user.
+    Repo: <a href="https://github.com/aditya-munday/Directioner-CLI" target="_blank" rel="noopener">aditya-munday/Directioner-CLI</a>
+  </footer>
+
+</div>
+</body>
+</html>

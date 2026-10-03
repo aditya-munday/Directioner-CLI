@@ -1,0 +1,815 @@
+/** Machine-local connection metadata, separate from OS-protected credentials. */
+import { promises as fs } from 'node:fs'
+import { homedir } from 'node:os'
+import path from 'node:path'
+import { z } from 'zod/v4'
+import { getSystemProcessEnv } from './env'
+
+export const BYOK_SECRET_SERVICE = 'com.directioner.byok.v1'
+const envReference = /^env:[A-Za-z_][A-Za-z0-9_]*$/
+const ownedReference = /^connection:[a-f0-9-]+:[1-9][0-9]*$/
+const text = z.string().trim().min(1).max(256)
+const connectionSchema = z
+  .object({
+    id: z.uuid(),
+    revision: z.number().int().positive(),
+    name: text,
+    provider: z.enum([
+      'openrouter',
+      'openai-compatible',
+      // Directioner's built-in providers. They are OpenAI-compatible (or
+      // Anthropic-protocol) transports under a product name, and travel the
+      // same local-inference path. Kept distinct so the provider id survives
+      // to display and diagnostics.
+      'heital',
+      'eternal',
+      'infernal',
+    ]),
+    model: text,
+    baseUrl: z.string().max(2048).optional(),
+    contextWindow: z.number().int().min(4096).max(2_000_000).optional(),
+    maxOutputTokens: z.number().int().min(1).max(1_000_000).optional(),
+    credentialRef: z
+      .string()
+      .refine(
+        (value) => envReference.test(value) || ownedReference.test(value),
+      ),
+    createdAt: z.iso.datetime(),
+    updatedAt: z.iso.datetime(),
+  })
+  .strict()
+export type ByokConnection = z.infer<typeof connectionSchema>
+export type ByokProvider = ByokConnection['provider']
+/** Runtime-only. The built-in resolver makes apiKey non-enumerable. */
+export type ResolvedByokConnection = ByokConnection & {
+  apiKey: string
+  /** Recheck revocation before every provider request; never serialized. */
+  assertCurrent?: () => Promise<void>
+  /**
+   * Wire protocol override, used by Directioner's native providers.
+   *
+   * The persisted schema only knows the OpenAI-compatible shape, but
+   * Directioner also ships an Anthropic-protocol provider (Eternal). This is
+   * runtime-only and never written to disk, so it does not belong in the
+   * stored connection schema.
+   */
+  protocol?: 'anthropic'
+}
+export type ByokSecretStore = {
+  get(reference: string): Promise<string | undefined>
+  set(reference: string, value: string): Promise<void>
+  delete(reference: string): Promise<void>
+}
+export type ByokMetadataStore = {
+  get(): Promise<ByokConnection[]>
+  set(connections: ByokConnection[]): Promise<void>
+  /** Must serialize read/modify/write across processes for persistent stores. */
+  withLock?<T>(operation: () => Promise<T>): Promise<T>
+}
+export type ByokConnectionInput = {
+  /** User-configured limits, not a claim of tested model capability. */
+  contextWindow?: number
+  maxOutputTokens?: number
+  name: string
+  provider: ByokProvider
+  model: string
+  baseUrl?: string
+  apiKey?: string
+  credentialRef?: string
+}
+export type ByokConnectionPatch = Partial<ByokConnectionInput>
+export type ByokValidationResult =
+  | { ok: true; connection: ByokConnection }
+  | {
+      ok: false
+      connection: ByokConnection
+      message: string
+      statusCode?: number
+    }
+export type ByokConnectionStore = {
+  create(input: ByokConnectionInput): Promise<ByokConnection>
+  list(): Promise<ByokConnection[]>
+  update(input: {
+    id: string
+    revision: number
+    patch: ByokConnectionPatch
+  }): Promise<ByokConnection>
+  remove(input: { id: string; revision: number }): Promise<void>
+  resolve(input: {
+    id: string
+    revision: number
+  }): Promise<ResolvedByokConnection>
+  validate(input: {
+    id: string
+    revision: number
+  }): Promise<ByokValidationResult>
+}
+
+/** Validate before either storing a connection or attaching credentials to a request. */
+export function normalizeByokBaseUrl(
+  provider: ByokProvider,
+  baseUrl?: string,
+): string {
+  if (provider === 'openrouter') return 'https://openrouter.ai/api/v1'
+  // `openai-compatible` is the generic label; the Directioner ids are the same
+  // transport behind a product name, so they take the same validation branch.
+  if (
+    provider !== 'openai-compatible' &&
+    provider !== 'heital' &&
+    provider !== 'eternal' &&
+    provider !== 'infernal'
+  )
+    throw new Error('Unsupported BYOK provider')
+  let url: URL
+  try {
+    url = new URL(baseUrl ?? '')
+  } catch {
+    throw new Error('Enter a valid provider base URL')
+  }
+  const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
+    throw new Error(
+      'Provider endpoints require HTTPS; HTTP is allowed only on loopback',
+    )
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error(
+      'Provider URLs cannot contain credentials, query parameters or fragments',
+    )
+  }
+  return url.toString().replace(/\/+$/, '')
+}
+export function byokCompletionUrl(
+  connection: Pick<ByokConnection, 'provider' | 'baseUrl'>,
+): string {
+  return (
+    normalizeByokBaseUrl(connection.provider, connection.baseUrl) +
+    '/chat/completions'
+  )
+}
+
+/**
+ * Base URL for a provider speaking a native (non-OpenAI-compatible) protocol,
+ * which appends its own resource paths — Claude's Messages API, for example.
+ */
+export function byokProviderBaseUrl(
+  connection: Pick<ByokConnection, 'provider' | 'baseUrl'>,
+): string {
+  return normalizeByokBaseUrl(connection.provider, connection.baseUrl)
+}
+function parseConnections(value: unknown): ByokConnection[] {
+  const parsed = z.array(connectionSchema).safeParse(value)
+  if (!parsed.success)
+    throw new Error(
+      'BYOK connection metadata is corrupt; restore it before continuing',
+    )
+  if (new Set(parsed.data.map((item) => item.id)).size !== parsed.data.length) {
+    throw new Error('BYOK connection metadata contains duplicate connections')
+  }
+  for (const item of parsed.data) {
+    byokModelLimits(item)
+    normalizeByokBaseUrl(item.provider, item.baseUrl)
+    if (
+      !envReference.test(item.credentialRef) &&
+      !item.credentialRef.startsWith(`connection:${item.id}:`)
+    ) {
+      throw new Error(
+        'BYOK credential reference belongs to a different connection',
+      )
+    }
+  }
+  return parsed.data
+}
+/**
+ * The limits a connection gets when nobody chose any. The Desktop settings
+ * form pre-fills exactly this pair, and the store persists it, so a stored
+ * 32,768 / 4,096 almost always means "not configured" rather than a decision.
+ */
+export const BYOK_DEFAULT_CONTEXT_WINDOW = 32_768
+export const BYOK_DEFAULT_MAX_OUTPUT_TOKENS = 4_096
+/** A remote endpoint that does not report its model's window. */
+export const BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW = 131_072
+/**
+ * The most an automatically-chosen window may be: the hosted budget's order of
+ * magnitude, since every token of a BYOK request is billed to the user's key.
+ * A user who wants more types it into the connection.
+ */
+export const BYOK_DISCOVERED_CONTEXT_WINDOW_CAP = 400_000
+
+export function byokModelLimits(connection: {
+  contextWindow?: number
+  maxOutputTokens?: number
+}) {
+  const contextWindow = connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW
+  const maxOutputTokens =
+    connection.maxOutputTokens ??
+    Math.min(BYOK_DEFAULT_MAX_OUTPUT_TOKENS, Math.floor(contextWindow / 4))
+  if (
+    !Number.isInteger(contextWindow) ||
+    contextWindow < 4096 ||
+    contextWindow > 2_000_000 ||
+    !Number.isInteger(maxOutputTokens) ||
+    maxOutputTokens < 1 ||
+    maxOutputTokens >= contextWindow
+  ) {
+    throw new Error(
+      'Choose a context limit of 4096–2000000 tokens and a smaller positive output limit',
+    )
+  }
+  return {
+    contextWindow,
+    maxOutputTokens,
+    maxContextLength: Math.floor((contextWindow - maxOutputTokens) * 0.9),
+  }
+}
+
+/** True when the connection carries the untouched default limits (see above). */
+export function hasDefaultByokLimits(connection: {
+  contextWindow?: number
+  maxOutputTokens?: number
+}): boolean {
+  return (
+    (connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW) ===
+      BYOK_DEFAULT_CONTEXT_WINDOW &&
+    (connection.maxOutputTokens ?? BYOK_DEFAULT_MAX_OUTPUT_TOKENS) ===
+      BYOK_DEFAULT_MAX_OUTPUT_TOKENS
+  )
+}
+
+function isLoopbackByokEndpoint(
+  connection: Pick<ByokConnection, 'provider' | 'baseUrl'>,
+): boolean {
+  if (connection.provider !== 'openai-compatible') return false
+  try {
+    const { hostname } = new URL(
+      normalizeByokBaseUrl(connection.provider, connection.baseUrl),
+    )
+    return ['localhost', '127.0.0.1', '[::1]'].includes(hostname)
+  } catch {
+    return false
+  }
+}
+
+/** Fields OpenAI-compatible `/models` listings use for a model's window:
+ *  OpenRouter/Together (`context_length`), Groq (`context_window`), vLLM
+ *  (`max_model_len`), LM Studio (`loaded_context_length`), and others. */
+const CONTEXT_WINDOW_FIELDS = [
+  'context_length',
+  'context_window',
+  'max_model_len',
+  'max_context_length',
+  'loaded_context_length',
+] as const
+
+function positiveInteger(value: unknown): number | undefined {
+  const number = typeof value === 'string' ? Number(value) : value
+  return typeof number === 'number' && Number.isInteger(number) && number > 0
+    ? number
+    : undefined
+}
+
+/** The window a `/models` listing reports for `model`, or undefined. */
+export function contextWindowFromModelList(
+  body: unknown,
+  model: string,
+): number | undefined {
+  const list = Array.isArray(body)
+    ? body
+    : body && typeof body === 'object' && Array.isArray((body as any).data)
+      ? ((body as any).data as unknown[])
+      : []
+  const entries = list.filter(
+    (entry): entry is Record<string, unknown> =>
+      !!entry && typeof entry === 'object',
+  )
+  // OpenRouter variants (`vendor/model:free`) fall back to the base model.
+  const candidates = [model, model.replace(/:[^/:]+$/, '')]
+  for (const id of candidates) {
+    const entry = entries.find(
+      (item) => item.id === id || item.canonical_slug === id,
+    )
+    if (!entry) continue
+    const topProvider =
+      entry.top_provider && typeof entry.top_provider === 'object'
+        ? (entry.top_provider as Record<string, unknown>)
+        : {}
+    for (const value of [
+      ...CONTEXT_WINDOW_FIELDS.map((field) => entry[field]),
+      topProvider.context_length,
+    ]) {
+      const window = positiveInteger(value)
+      if (window !== undefined) return window
+    }
+  }
+  return undefined
+}
+
+const discoveredWindows = new Map<
+  string,
+  { expiresAt: number; window: Promise<number | undefined> }
+>()
+const DISCOVERY_HIT_TTL_MS = 6 * 60 * 60 * 1000
+const DISCOVERY_MISS_TTL_MS = 10 * 60 * 1000
+const DISCOVERY_TIMEOUT_MS = 4_000
+
+/** Test seam: forget every cached discovery. */
+export function clearByokContextWindowCache(): void {
+  discoveredWindows.clear()
+}
+
+/**
+ * Ask the provider's `/models` listing how large this model's window is.
+ * Best effort: never throws, and a miss is remembered briefly so a provider
+ * without the field is not asked on every turn. The listing is what the
+ * connection check already calls; OpenRouter's is public, so the key is sent
+ * only to an OpenAI-compatible endpoint that needs it.
+ */
+export async function discoverByokContextWindow(
+  connection: Pick<
+    ResolvedByokConnection,
+    'provider' | 'baseUrl' | 'model' | 'apiKey'
+  >,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+): Promise<number | undefined> {
+  let base: string
+  try {
+    base = normalizeByokBaseUrl(connection.provider, connection.baseUrl)
+  } catch {
+    return undefined
+  }
+  const key = `${base}\n${connection.model}`
+  const now = Date.now()
+  const cached = discoveredWindows.get(key)
+  if (cached && cached.expiresAt > now) return cached.window
+  const window = (async () => {
+    try {
+      const response = await fetchImpl(`${base}/models`, {
+        headers:
+          connection.provider === 'openrouter'
+            ? {}
+            : { Authorization: `Bearer ${connection.apiKey}` },
+        redirect: 'error',
+        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
+      })
+      if (!response.ok) {
+        await response.body?.cancel()
+        return undefined
+      }
+      return contextWindowFromModelList(await response.json(), connection.model)
+    } catch {
+      return undefined
+    }
+  })()
+  discoveredWindows.set(key, { expiresAt: now + DISCOVERY_HIT_TTL_MS, window })
+  const result = await window
+  if (result === undefined)
+    discoveredWindows.set(key, {
+      expiresAt: now + DISCOVERY_MISS_TTL_MS,
+      window,
+    })
+  return result
+}
+
+/**
+ * The connection a run should use: identical, unless its limits are the
+ * untouched defaults. Those are a 32,768-token guess, and for a coding agent
+ * whose tool schemas and prompt alone are ~15-20k tokens, compacting at 80% of
+ * 90% of (32,768 - 4,096) leaves a few thousand tokens of conversation: every
+ * few tool calls the run compacted, and the summary itself sat above the line
+ * (Desktop feedback 2026-09-24 and 09-27, "compacts every 3-5 turns").
+ *
+ * The provider's own number wins when its `/models` listing reports one
+ * (capped at BYOK_DISCOVERED_CONTEXT_WINDOW_CAP). Otherwise a remote endpoint
+ * gets 128k, which nearly every hosted coding model supports, and a loopback
+ * server keeps the configured default, because a local server's window is
+ * whatever it was launched with. Limits a user actually typed are never
+ * replaced. The credential stays non-enumerable on the copy.
+ */
+export async function withEffectiveByokLimits(
+  connection: ResolvedByokConnection,
+  options: { fetch?: typeof globalThis.fetch } = {},
+): Promise<ResolvedByokConnection> {
+  if (!hasDefaultByokLimits(connection)) return connection
+  const discovered = await discoverByokContextWindow(connection, options.fetch)
+  const contextWindow =
+    // A window must exceed the output limit (byokModelLimits' own rule).
+    discovered !== undefined && discovered > BYOK_DEFAULT_MAX_OUTPUT_TOKENS
+      ? Math.min(discovered, BYOK_DISCOVERED_CONTEXT_WINDOW_CAP)
+      : isLoopbackByokEndpoint(connection)
+        ? BYOK_DEFAULT_CONTEXT_WINDOW
+        : BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW
+  if (
+    contextWindow === (connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW)
+  )
+    return connection
+  const effective = {
+    ...connection,
+    contextWindow,
+    maxOutputTokens:
+      connection.maxOutputTokens ?? BYOK_DEFAULT_MAX_OUTPUT_TOKENS,
+  } as ResolvedByokConnection
+  Object.defineProperty(effective, 'apiKey', {
+    value: connection.apiKey,
+    enumerable: false,
+  })
+  if (connection.assertCurrent)
+    Object.defineProperty(effective, 'assertCurrent', {
+      value: connection.assertCurrent,
+      enumerable: false,
+    })
+  return Object.freeze(effective)
+}
+
+function cleanInput(input: ByokConnectionInput) {
+  const limits = byokModelLimits(input)
+  const name = text.safeParse(input.name),
+    model = text.safeParse(input.model)
+  if (!name.success || !model.success)
+    throw new Error('Connection name and model must contain 1–256 characters')
+  const baseUrl = normalizeByokBaseUrl(input.provider, input.baseUrl)
+  if (
+    input.apiKey !== undefined &&
+    (!input.apiKey.trim() ||
+      /[\r\n]/.test(input.apiKey) ||
+      input.apiKey.length > 4096)
+  ) {
+    throw new Error(
+      'Enter a non-empty API key without line breaks (maximum 4096 characters)',
+    )
+  }
+  if (
+    input.credentialRef !== undefined &&
+    !envReference.test(input.credentialRef)
+  ) {
+    throw new Error(
+      'Only explicit env:VARIABLE credential references may be supplied',
+    )
+  }
+  if (input.apiKey !== undefined && input.credentialRef !== undefined) {
+    throw new Error('Choose an API key or an environment reference, not both')
+  }
+  return {
+    contextWindow: limits.contextWindow,
+    maxOutputTokens: limits.maxOutputTokens,
+    name: name.data,
+    model: model.data,
+    provider: input.provider,
+    baseUrl,
+  }
+}
+const queues = new WeakMap<ByokMetadataStore, Promise<unknown>>()
+export function createByokConnectionStore(params: {
+  metadataStore: ByokMetadataStore
+  secretStore: ByokSecretStore
+  fetch?: typeof globalThis.fetch
+}): ByokConnectionStore {
+  const {
+    metadataStore,
+    secretStore,
+    fetch: fetchImpl = globalThis.fetch,
+  } = params
+  const read = async () => parseConnections(await metadataStore.get())
+  function exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = queues.get(metadataStore) ?? Promise.resolve()
+    const next = previous
+      .catch(() => {})
+      .then(() =>
+        metadataStore.withLock
+          ? metadataStore.withLock(operation)
+          : operation(),
+      )
+    queues.set(
+      metadataStore,
+      next.catch(() => {}),
+    )
+    return next
+  }
+  async function lookup(id: string, revision: number) {
+    const connections = await read()
+    const connection = connections.find((item) => item.id === id)
+    if (!connection)
+      throw new Error(
+        'BYOK connection was removed; select another provider or a Directioner model to continue',
+      )
+    if (connection.revision !== revision)
+      throw new Error(
+        'BYOK connection changed; select its current revision to continue',
+      )
+    return { connection, connections }
+  }
+  async function getSecret(reference: string) {
+    let key: string | undefined
+    try {
+      key = await secretStore.get(reference)
+    } catch {
+      throw new Error('Could not unlock the BYOK credential store')
+    }
+    if (!key?.trim() || /[\r\n]/.test(key))
+      throw new Error('BYOK credential is unavailable or invalid')
+    return key.trim()
+  }
+  async function writeSecret(reference: string, key: string) {
+    try {
+      await secretStore.set(reference, key.trim())
+    } catch {
+      throw new Error('Could not save the API key in OS credential storage')
+    }
+  }
+  async function eraseSecret(reference: string) {
+    if (envReference.test(reference)) return
+    try {
+      await secretStore.delete(reference)
+    } catch {
+      throw new Error(
+        'Could not remove the OS credential; unlock the store and retry',
+      )
+    }
+  }
+  const store: ByokConnectionStore = {
+    create: (input) =>
+      exclusive(async () => {
+        const fields = cleanInput(input)
+        if (!input.apiKey && !input.credentialRef)
+          throw new Error('An API key or environment reference is required')
+        const connections = await read()
+        const id = crypto.randomUUID(),
+          now = new Date().toISOString()
+        const credentialRef = input.credentialRef ?? `connection:${id}:1`
+        const connection = {
+          ...fields,
+          id,
+          revision: 1,
+          credentialRef,
+          createdAt: now,
+          updatedAt: now,
+        }
+        if (input.apiKey !== undefined)
+          await writeSecret(credentialRef, input.apiKey)
+        try {
+          await metadataStore.set([...connections, connection])
+        } catch (error) {
+          if (input.apiKey !== undefined)
+            await secretStore.delete(credentialRef).catch(() => {})
+          throw error
+        }
+        return { ...connection }
+      }),
+    list: read,
+    update: ({ id, revision, patch }) =>
+      exclusive(async () => {
+        const { connection: existing, connections } = await lookup(id, revision)
+        const fields = cleanInput({
+          ...existing,
+          ...patch,
+          credentialRef: patch.credentialRef,
+          apiKey: patch.apiKey,
+        })
+        const changedEndpoint =
+          fields.baseUrl !==
+          normalizeByokBaseUrl(existing.provider, existing.baseUrl)
+        if (
+          (changedEndpoint || fields.provider !== existing.provider) &&
+          patch.apiKey === undefined &&
+          patch.credentialRef === undefined
+        ) {
+          throw new Error(
+            'Changing provider endpoints requires explicitly supplying the credential again',
+          )
+        }
+        const nextRevision = revision + 1
+        // New stored revision gets its own credential, so old reads cannot observe replacement keys.
+        const credentialRef =
+          patch.credentialRef ??
+          (patch.apiKey === undefined &&
+          envReference.test(existing.credentialRef)
+            ? existing.credentialRef
+            : `connection:${id}:${nextRevision}`)
+        const ownsNewSecret = !envReference.test(credentialRef)
+        if (ownsNewSecret)
+          await writeSecret(
+            credentialRef,
+            patch.apiKey ?? (await getSecret(existing.credentialRef)),
+          )
+        const updated = {
+          ...existing,
+          ...fields,
+          credentialRef,
+          revision: nextRevision,
+          updatedAt: new Date().toISOString(),
+        }
+        try {
+          await metadataStore.set(
+            connections.map((item) => (item.id === id ? updated : item)),
+          )
+        } catch (error) {
+          if (ownsNewSecret)
+            await secretStore.delete(credentialRef).catch(() => {})
+          throw error
+        }
+        if (credentialRef !== existing.credentialRef) {
+          try {
+            await eraseSecret(existing.credentialRef)
+          } catch {
+            // Keep the old reference reachable so cleanup can be retried.
+            await metadataStore.set(connections)
+            if (ownsNewSecret)
+              await secretStore.delete(credentialRef).catch(() => {})
+            throw new Error(
+              'Could not rotate the OS credential; connection unchanged. Unlock the store and retry.',
+            )
+          }
+        }
+        return { ...updated }
+      }),
+    remove: ({ id, revision }) =>
+      exclusive(async () => {
+        const { connection, connections } = await lookup(id, revision)
+        // Erase first: on failure metadata remains so the user can retry.
+        await eraseSecret(connection.credentialRef)
+        await metadataStore.set(connections.filter((item) => item.id !== id))
+      }),
+    resolve: ({ id, revision }) =>
+      exclusive(async () => {
+        const { connection } = await lookup(id, revision)
+        const result = { ...connection } as ResolvedByokConnection
+        Object.defineProperty(result, 'apiKey', {
+          value: await getSecret(connection.credentialRef),
+          enumerable: false,
+        })
+        Object.defineProperty(result, 'assertCurrent', {
+          value: () =>
+            exclusive(async () => {
+              await lookup(id, revision)
+            }),
+          enumerable: false,
+        })
+        return Object.freeze(result)
+      }),
+    async validate(selection) {
+      const resolved = await store.resolve(selection)
+      const connection = { ...resolved }
+      try {
+        await resolved.assertCurrent?.()
+        const response = await fetchImpl(
+          normalizeByokBaseUrl(resolved.provider, resolved.baseUrl) +
+            (resolved.provider === 'openrouter' ? '/key' : '/models'),
+          {
+            headers: { Authorization: `Bearer ${resolved.apiKey}` },
+            redirect: 'error',
+            signal: AbortSignal.timeout(10_000),
+          },
+        )
+        // No provider-controlled error body is logged or returned; it may echo headers.
+        await response.body?.cancel()
+        if (!response.ok)
+          return {
+            ok: false,
+            connection,
+            message: `Provider connection check failed (HTTP ${response.status})`,
+            statusCode: response.status,
+          }
+        return { ok: true, connection }
+      } catch {
+        return {
+          ok: false,
+          connection,
+          message:
+            'Could not reach the provider securely. Check its URL, connection and credentials.',
+        }
+      }
+    },
+  }
+  return store
+}
+
+type BunSecrets = {
+  get(options: { service: string; name: string }): Promise<string | null>
+  set(service: string, name: string, value: string): Promise<void>
+  delete(options: { service: string; name: string }): Promise<boolean>
+}
+function bunSecrets(): BunSecrets {
+  const secrets = (
+    globalThis as typeof globalThis & { Bun?: { secrets?: BunSecrets } }
+  ).Bun?.secrets
+  if (!secrets)
+    throw new Error(
+      'OS credential storage requires Bun; use an explicit environment credential for this runtime',
+    )
+  return secrets
+}
+export function createEnvironmentByokSecretStore(
+  environment: NodeJS.ProcessEnv = getSystemProcessEnv(),
+): ByokSecretStore {
+  return {
+    async get(reference) {
+      return envReference.test(reference)
+        ? environment[reference.slice(4)]
+        : undefined
+    },
+    async set() {
+      throw new Error('Environment credentials are read-only')
+    },
+    async delete() {},
+  }
+}
+
+/** Metadata only. Same default directory in packaged Desktop and standalone CLI. */
+export function createBunByokMetadataStore(
+  options: { directory?: string } = {},
+): ByokMetadataStore {
+  const directory =
+    options.directory ??
+    getSystemProcessEnv().DIRECTIONER_BYOK_CONFIG_DIR ??
+    path.join(homedir(), '.config', 'directioner', 'byok')
+  const file = path.join(directory, 'connections.json')
+  const lock = path.join(directory, 'connections.lock')
+  return {
+    async get() {
+      try {
+        return parseConnections(JSON.parse(await fs.readFile(file, 'utf8')))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+        throw new Error(
+          'Cannot read BYOK connection metadata; restore the configuration before continuing',
+        )
+      }
+    },
+    async set(connections) {
+      const parsed = parseConnections(connections)
+      await fs.mkdir(directory, { recursive: true, mode: 0o700 })
+      const temporary = path.join(
+        directory,
+        `connections-${crypto.randomUUID()}.tmp`,
+      )
+      try {
+        await fs.writeFile(temporary, JSON.stringify(parsed, null, 2) + '\n', {
+          mode: 0o600,
+          flag: 'wx',
+        })
+        await fs.rename(temporary, file)
+      } finally {
+        await fs.unlink(temporary).catch(() => {})
+      }
+    },
+    async withLock(operation) {
+      await fs.mkdir(directory, { recursive: true, mode: 0o700 })
+      const started = Date.now()
+      let handle
+      while (!handle) {
+        try {
+          handle = await fs.open(lock, 'wx', 0o600)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+          if (Date.now() - started >= 5000)
+            throw new Error(
+              'BYOK settings are locked. Close other Directioner processes; if a process crashed, remove connections.lock from the BYOK configuration directory and retry.',
+            )
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+      }
+      try {
+        await handle.writeFile(String(process.pid))
+        return await operation()
+      } finally {
+        await handle.close()
+        await fs.unlink(lock)
+      }
+    },
+  }
+}
+export function createBunByokConnectionStore(
+  options: {
+    directory?: string
+    environment?: NodeJS.ProcessEnv
+    secretStore?: ByokSecretStore
+    fetch?: typeof globalThis.fetch
+  } = {},
+): ByokConnectionStore {
+  const environment = options.environment ?? getSystemProcessEnv()
+  const secretStore: ByokSecretStore = options.secretStore ?? {
+    async get(reference) {
+      if (envReference.test(reference)) return environment[reference.slice(4)]
+      return (
+        (await bunSecrets().get({
+          service: BYOK_SECRET_SERVICE,
+          name: reference,
+        })) ?? undefined
+      )
+    },
+    async set(reference, value) {
+      await bunSecrets().set(BYOK_SECRET_SERVICE, reference, value)
+    },
+    async delete(reference) {
+      if (!envReference.test(reference))
+        await bunSecrets().delete({
+          service: BYOK_SECRET_SERVICE,
+          name: reference,
+        })
+    },
+  }
+  return createByokConnectionStore({
+    metadataStore: createBunByokMetadataStore(options),
+    secretStore,
+    fetch: options.fetch,
+  })
+}

@@ -318,4 +318,91 @@ describe('aria contract: speech shapes and stream rules', () => {
     ]
     expect(reconstructAriaTtsStream(events).ok).toBe(false)
   })
+
+  test('the empty terminal frame terminates the stream and contributes no samples', () => {
+    const events = [
+      {
+        contract_version: 1,
+        sequence: 0,
+        is_final: false,
+        audio: { sample_rate: 16000, channels: 1, samples_le_base64: PCM_4 },
+      },
+      // The backend's final frame carries no audio; it is a terminator, not a chunk.
+      {
+        contract_version: 1,
+        sequence: 1,
+        is_final: true,
+        audio: { sample_rate: 16000, channels: 1, samples_le_base64: '' },
+      },
+    ]
+    const result = reconstructAriaTtsStream(events)
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(Array.from(result.value)).toEqual([1, 2, 3, 4])
+  })
+
+  test('an empty non-terminal chunk is refused, not treated as silence', () => {
+    const events = [
+      {
+        contract_version: 1,
+        sequence: 0,
+        is_final: false,
+        audio: { sample_rate: 16000, channels: 1, samples_le_base64: '' },
+      },
+      {
+        contract_version: 1,
+        sequence: 1,
+        is_final: true,
+        audio: { sample_rate: 16000, channels: 1, samples_le_base64: '' },
+      },
+    ]
+    expect(reconstructAriaTtsStream(events, 1, { rejectEmptyNonTerminal: true }).ok).toBe(false)
+  })
+
+  test('events after the terminal frame cannot extend the audio', () => {
+    const events = [
+      {
+        contract_version: 1,
+        sequence: 0,
+        is_final: false,
+        audio: { sample_rate: 16000, channels: 1, samples_le_base64: PCM_4 },
+      },
+      {
+        contract_version: 1,
+        sequence: 1,
+        is_final: true,
+        audio: { sample_rate: 16000, channels: 1, samples_le_base64: '' },
+      },
+      // A producer that keeps emitting past its terminal frame must not extend
+      // the utterance; the terminal frame is authoritative.
+      {
+        contract_version: 1,
+        sequence: 2,
+        is_final: false,
+        audio: { sample_rate: 16000, channels: 1, samples_le_base64: PCM_4 },
+      },
+    ]
+    const result = reconstructAriaTtsStream(events)
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(Array.from(result.value)).toEqual([1, 2, 3, 4])
+  })
+
+  test('the speech parsers refuse an unsupported contract version', () => {
+    expect(
+      parseAriaSttResponse({ contract_version: 2, text: 'hi' }).ok,
+    ).toBe(false)
+    expect(
+      parseAriaTtsResponse({
+        contract_version: 2,
+        audio: { sample_rate: 16000, channels: 1, samples_le_base64: PCM_8 },
+      }).ok,
+    ).toBe(false)
+  })
+
+  test('the stt stream refuses an unsupported contract version mid-stream', () => {
+    const events = [
+      { contract_version: 1, is_final: false, text: 'hello' },
+      { contract_version: 2, is_final: true, text: 'hello world' },
+    ]
+    expect(reconstructAriaSttStream(events).ok).toBe(false)
+  })
 })

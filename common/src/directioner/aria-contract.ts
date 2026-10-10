@@ -738,10 +738,21 @@ export function reconstructAriaSttStream(
  * Sequences must be contiguous and zero-based, and the stream is complete only
  * when an event with `is_final: true` is seen. The final frame is typically
  * empty; it is the terminator, not audio.
+ *
+ * Empty terminal frames contribute no samples. Pass
+ * `{ rejectEmptyNonTerminal: true }` for a streaming client: a producer that
+ * emits an empty *non-terminal* chunk is then a contract violation rather than
+ * silently-ignored silence. The batch accumulator leaves them ignored, mirroring
+ * Aria's own batch merge, which appends every chunk and never flags one final.
  */
+export interface AriaTtsStreamOptions {
+  readonly rejectEmptyNonTerminal?: boolean
+}
+
 export function reconstructAriaTtsStream(
   events: readonly unknown[],
   supported: number = SUPPORTED_ARIA_CONTRACT_VERSION,
+  options: AriaTtsStreamOptions = {},
 ): CheckResult<Int16Array> {
   const parts: Int16Array[] = []
   let expectedSequence = 0
@@ -763,6 +774,13 @@ export function reconstructAriaTtsStream(
     if (!decoded.ok) return { ok: false, reason: decoded.reason }
     if (typeof event.is_final !== 'boolean') {
       return { ok: false, reason: 'stream event needs a boolean is_final' }
+    }
+    if (
+      options.rejectEmptyNonTerminal === true &&
+      !event.is_final &&
+      decoded.value.length === 0
+    ) {
+      return { ok: false, reason: 'an empty non-terminal synthesis chunk is not silence' }
     }
     if (event.is_final) {
       finalSeen = true

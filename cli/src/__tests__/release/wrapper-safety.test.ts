@@ -158,7 +158,7 @@ describe('Directioner launcher install behavior', () => {
         env: {},
       })
       expect(() => launcher.__testing.ensureInstalled()).toThrow(
-        /packaged binary is missing.*npm install -g directioner/s,
+        /packaged binary is missing.*Directioner-OS image/s,
       )
     } finally {
       rmSync(pkg, { recursive: true, force: true })
@@ -263,20 +263,35 @@ describe('Directioner launcher install behavior', () => {
     }
   })
 
-  test('uses the platform binary name (exe on win32)', () => {
+  test('uses the platform binary name (Linux only)', () => {
     const pkg = makePackageDir()
     const cache = mkdtempSync(join(tmpdir(), 'directioner-cache-'))
     try {
-      writeFileSync(join(pkg, 'directioner.exe'), 'WINBIN')
+      const launcher = createLauncher({
+        packageDir: pkg,
+        platform: 'linux',
+        arch: 'x64',
+        env: makeEnv(cache),
+      })
+      const installed = launcher.__testing.ensureInstalled()
+      expect(installed).toBe(join(cache, 'directioner'))
+    } finally {
+      rmSync(pkg, { recursive: true, force: true })
+      rmSync(cache, { recursive: true, force: true })
+    }
+  })
+
+  test('refuses an unsupported (non-Linux) platform', () => {
+    const pkg = makePackageDir()
+    const cache = mkdtempSync(join(tmpdir(), 'directioner-cache-'))
+    try {
       const launcher = createLauncher({
         packageDir: pkg,
         platform: 'win32',
         arch: 'x64',
         env: makeEnv(cache),
       })
-      const installed = launcher.__testing.ensureInstalled()
-      expect(installed).toBe(join(cache, 'directioner.exe'))
-      expect(readFileSync(installed, 'utf8')).toBe('WINBIN')
+      expect(() => launcher.__testing.ensureInstalled()).toThrow(/unsupported platform/i)
     } finally {
       rmSync(pkg, { recursive: true, force: true })
       rmSync(cache, { recursive: true, force: true })

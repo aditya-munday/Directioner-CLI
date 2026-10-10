@@ -3,6 +3,12 @@
 /**
  * Build the Directioner release package locally.
  *
+ * DEVELOPMENT-ONLY / INTERNAL. The customer artifact is the Directioner-OS
+ * component (see `scripts/build-component.ts`), not this npm package. This
+ * script exists to exercise the launcher path and its tests; nothing here is
+ * published, and `npm pack` is used only to produce a local `.tgz` for the
+ * clean-install artifact test.
+ *
  * This assembles the exact directory that would be published as the
  * `directioner` npm package — the compiled binary, its `tree-sitter.wasm`
  * sibling, and the standalone launcher — into a staging directory, then runs

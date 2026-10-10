@@ -6,6 +6,8 @@ import * as path from 'path'
 import { formatCodeSearchOutput } from '../../../common/src/util/format-code-search'
 import { getBundledRgPath } from '../native/ripgrep'
 
+import { parseCodeSearchFlags } from './code-search-args'
+import { defaultCodeSearchFlagsRefusal } from './code-search-flags'
 import { resolveReadPath } from './path-utils'
 
 import type { BeyondersToolOutput } from '../../../common/src/tools/list'
@@ -28,42 +30,9 @@ export const INCLUDED_HIDDEN_DIRS: readonly string[] = [
   '.husky', // Git hooks
 ]
 
-/**
- * Parse the user-facing flag string once so validation and process spawning see
- * the same argv. Quotes group whitespace but are not passed to ripgrep because
- * spawn() does not invoke a shell.
- */
-export function parseCodeSearchFlags(flags: string | undefined): string[] | null {
-  if (!flags?.trim()) return []
-  const tokens: string[] = []
-  let token = ''
-  let quote: "'" | '"' | null = null
-  let tokenStarted = false
-  for (const character of flags) {
-    if (quote) {
-      if (character === quote) quote = null
-      else token += character
-      tokenStarted = true
-      continue
-    }
-    if (character === "'" || character === '"') {
-      quote = character
-      tokenStarted = true
-    } else if (/\s/.test(character)) {
-      if (tokenStarted) {
-        tokens.push(token)
-        token = ''
-        tokenStarted = false
-      }
-    } else {
-      token += character
-      tokenStarted = true
-    }
-  }
-  if (quote) return null
-  if (tokenStarted) tokens.push(token)
-  return tokens
-}
+// The parser lives in its own module so the flag allowlist can share it without
+// importing this surface. Re-exported here so existing importers are unchanged.
+export { parseCodeSearchFlags } from './code-search-args'
 
 export function codeSearch({
   projectPath,
@@ -135,6 +104,15 @@ export function codeSearch({
       ])
     }
 
+    // Ripgrep is not a pure reader: `--pre <cmd>` executes a program, `-L`
+    // follows a symlink out of the search root, and `--config`/`--ignore-file`
+    // load an arbitrary file. Refuse anything outside the allowlist before a
+    // process exists, so a flag cannot reach execution or escape containment.
+    const flagsRefusal = defaultCodeSearchFlagsRefusal(flags)
+    if (flagsRefusal) {
+      return resolve([{ type: 'json', value: { errorMessage: flagsRefusal } }])
+    }
+
     // Use JSON output for robust parsing and early stopping
     // --no-config prevents user/system .ripgreprc from interfering
     // -n shows line numbers
@@ -143,8 +121,14 @@ export function codeSearch({
     // Search paths: '.' plus blessed hidden directories that actually exist
     // Filter out non-existent directories to avoid ripgrep stderr errors
     const existingHiddenDirs = INCLUDED_HIDDEN_DIRS.filter((dir) => {
+      const full = path.join(searchCwd, dir)
       try {
-        return fs.statSync(path.join(searchCwd, dir)).isDirectory()
+        // `lstat`, not `stat`: ripgrep follows a search path named on its
+        // command line even without `--follow`, so a hidden directory that is a
+        // symlink (e.g. `.github -> /outside`) would be searched through the
+        // link. Require a real directory whose leaf is not a symlink.
+        const info = fs.lstatSync(full)
+        return info.isDirectory() && !info.isSymbolicLink()
       } catch {
         return false
       }

@@ -182,6 +182,19 @@ export const ARIA_COMPATIBILITY_MATRIX: readonly CompatibilityRow[] = [
     disposition: 'IMPLEMENTED_BUT_PARTIALLY_VERIFIED',
   },
   {
+    concept: 'speech (recognition & synthesis)',
+    ariaActual:
+      'POST /v1/stt and /v1/tts (+ NDJSON /v1/stt/stream and /v1/tts/stream). Audio is a { sample_rate, channels, samples_le_base64 } payload of little-endian i16 PCM. Recognition streams replace the transcript and end with is_final; synthesis streams carry contiguous zero-based sequence numbers and end with an empty-audio is_final frame (crates/aria-backend/src/contract.rs).',
+    cliActual:
+      'This module mirrors the audio payload, STT/TTS request/response shapes, and both stream reconstructions; no live HTTP client wired yet.',
+    requiredChange:
+      'When the CLI consumes Aria speech, it must decode LE i16, apply replace semantics to recognition, and refuse a truncated synthesis stream.',
+    verification:
+      'aria-contract.test.ts: PCM round-trips, replace-semantics reconstruction, contiguous synthesis sequences, and a refused truncated stream.',
+    evidence: { kind: 'verified-repo', repo: ARIA, path: 'crates/aria-backend/src/contract.rs' },
+    disposition: 'IMPLEMENTED_BUT_PARTIALLY_VERIFIED',
+  },
+  {
     concept: 'routes / OS delegation',
     ariaActual:
       'A `RouteDto { capability, requires_confirmation }` hint on a reply, and a `DirectionerGateway` port whose only production impl is `NotIntegrated` (crates/aria-core/src/integration.rs). A route is a hint, never an authorization.',
@@ -547,6 +560,227 @@ export function reconstructAriaChatStream(
     return { ok: false, reason: 'stream ended without a final event; the reply is incomplete' }
   }
   return { ok: true, value: text }
+}
+
+// ---------------------------------------------------------------------------
+// 4b. Aria speech endpoint shapes (mirror of the real /v1 contract)
+//
+// The backend serves POST /v1/stt, /v1/stt/stream, /v1/tts and /v1/tts/stream.
+// These shapes are mirrored here so a client can recognise them without
+// re-deriving the wire rules. The rules that matter on the wire:
+//
+//   - Audio is little-endian i16 PCM, base64-encoded, with the rate and channel
+//     count stated explicitly. A single-channel frame is one i16 per sample.
+//   - Recognition streams use *replace* semantics: each event carries the
+//     transcript so far, and the stream is complete only when is_final is true.
+//   - Synthesis streams carry contiguous, zero-based sequence numbers and end
+//     with an empty-audio final frame, so a truncated stream is never mistaken
+//     for a complete answer.
+// ---------------------------------------------------------------------------
+
+/** An Aria PCM audio payload (little-endian i16, base64). */
+export interface AriaAudioPayload {
+  readonly sample_rate: number
+  readonly channels: number
+  readonly samples_le_base64: string
+}
+
+export interface AriaSttRequest {
+  readonly contract_version: number
+  readonly audio: AriaAudioPayload
+  readonly language?: string | null
+}
+
+export interface AriaSttResponse {
+  readonly contract_version: number
+  readonly text: string
+  readonly language?: string | null
+  readonly confidence?: number | null
+}
+
+/** One streamed recognition event. `text` is the transcript so far (replace). */
+export interface AriaSttStreamEvent {
+  readonly contract_version: number
+  readonly is_final: boolean
+  readonly text: string
+  readonly language?: string | null
+}
+
+export interface AriaTtsRequest {
+  readonly contract_version: number
+  readonly text: string
+  readonly language?: string | null
+  readonly voice?: string | null
+  readonly speed: number
+  readonly sample_rate: number
+}
+
+export interface AriaTtsResponse {
+  readonly contract_version: number
+  readonly audio: AriaAudioPayload
+}
+
+/** One streamed synthesis chunk. `sequence` is contiguous and zero-based. */
+export interface AriaTtsStreamEvent {
+  readonly contract_version: number
+  readonly sequence: number
+  readonly is_final: boolean
+  readonly audio: AriaAudioPayload
+}
+
+function checkAudioPayload(value: unknown): CheckResult<AriaAudioPayload> {
+  if (!isRecord(value)) return { ok: false, reason: 'audio is not an object' }
+  if (typeof value.sample_rate !== 'number' || !Number.isInteger(value.sample_rate)) {
+    return { ok: false, reason: 'audio.sample_rate must be an integer' }
+  }
+  if (
+    typeof value.channels !== 'number' ||
+    !Number.isInteger(value.channels) ||
+    value.channels < 1
+  ) {
+    return { ok: false, reason: 'audio.channels must be a positive integer' }
+  }
+  if (typeof value.samples_le_base64 !== 'string') {
+    return { ok: false, reason: 'audio.samples_le_base64 must be a string' }
+  }
+  return { ok: true, value: value as unknown as AriaAudioPayload }
+}
+
+export function parseAriaSttResponse(
+  value: unknown,
+  supported: number = SUPPORTED_ARIA_CONTRACT_VERSION,
+): CheckResult<AriaSttResponse> {
+  if (!isRecord(value)) return { ok: false, reason: 'stt response is not an object' }
+  const compat = checkAriaContractVersion(value, supported)
+  if (!compat.compatible) return { ok: false, reason: compat.reason ?? 'incompatible contract' }
+  if (typeof value.text !== 'string') return { ok: false, reason: 'text must be a string' }
+  return { ok: true, value: value as unknown as AriaSttResponse }
+}
+
+export function parseAriaTtsResponse(
+  value: unknown,
+  supported: number = SUPPORTED_ARIA_CONTRACT_VERSION,
+): CheckResult<AriaTtsResponse> {
+  if (!isRecord(value)) return { ok: false, reason: 'tts response is not an object' }
+  const compat = checkAriaContractVersion(value, supported)
+  if (!compat.compatible) return { ok: false, reason: compat.reason ?? 'incompatible contract' }
+  const audio = checkAudioPayload(value.audio)
+  if (!audio.ok) return { ok: false, reason: audio.reason }
+  return { ok: true, value: value as unknown as AriaTtsResponse }
+}
+
+/** Decode an Aria PCM payload into interleaved i16 samples (little-endian). */
+export function decodeAriaPcm(payload: AriaAudioPayload): CheckResult<Int16Array> {
+  const binary = atob(payload.samples_le_base64)
+  if (binary.length % 2 !== 0) {
+    return { ok: false, reason: 'audio payload has an odd byte count for i16 PCM' }
+  }
+  const samples = new Int16Array(binary.length / 2)
+  for (let i = 0; i < samples.length; i += 1) {
+    const lo = binary.charCodeAt(i * 2)
+    const hi = binary.charCodeAt(i * 2 + 1)
+    const unsigned = lo | (hi << 8)
+    // Sign-extend the 16-bit little-endian value.
+    samples[i] = unsigned >= 0x8000 ? unsigned - 0x10000 : unsigned
+  }
+  return { ok: true, value: samples }
+}
+
+/** Encode interleaved i16 samples into an Aria PCM payload (little-endian). */
+export function encodeAriaPcm(
+  samples: Int16Array,
+  sampleRate: number,
+  channels = 1,
+): AriaAudioPayload {
+  let binary = ''
+  for (const sample of samples) {
+    const unsigned = sample < 0 ? sample + 0x10000 : sample
+    binary += String.fromCharCode(unsigned & 0xff, (unsigned >> 8) & 0xff)
+  }
+  return { sample_rate: sampleRate, channels, samples_le_base64: btoa(binary) }
+}
+
+/**
+ * Reconstruct a transcript from a stream of Aria NDJSON recognition events.
+ * Aria uses replace semantics: each non-final event supersedes the previous, so
+ * only the last event's text is the transcript. The stream is complete only when
+ * a final event is seen; a stream with no final event is incomplete, not a short
+ * transcript, mirroring Aria's own rule.
+ */
+export function reconstructAriaSttStream(
+  events: readonly unknown[],
+  supported: number = SUPPORTED_ARIA_CONTRACT_VERSION,
+): CheckResult<string> {
+  let text = ''
+  let finalSeen = false
+  for (const event of events) {
+    if (!isRecord(event)) return { ok: false, reason: 'stream event is not an object' }
+    const compat = checkAriaContractVersion(event, supported)
+    if (!compat.compatible) return { ok: false, reason: compat.reason ?? 'incompatible contract' }
+    if (typeof event.text !== 'string' || typeof event.is_final !== 'boolean') {
+      return { ok: false, reason: 'stream event needs a string text and boolean is_final' }
+    }
+    // Replace, not append: the event carries the transcript so far.
+    text = event.text
+    if (event.is_final) {
+      finalSeen = true
+      break
+    }
+  }
+  if (!finalSeen) {
+    return { ok: false, reason: 'stream ended without a final event; the transcript is incomplete' }
+  }
+  return { ok: true, value: text }
+}
+
+/**
+ * Reconstruct synthesized audio from a stream of Aria NDJSON synthesis events.
+ * Sequences must be contiguous and zero-based, and the stream is complete only
+ * when an event with `is_final: true` is seen. The final frame is typically
+ * empty; it is the terminator, not audio.
+ */
+export function reconstructAriaTtsStream(
+  events: readonly unknown[],
+  supported: number = SUPPORTED_ARIA_CONTRACT_VERSION,
+): CheckResult<Int16Array> {
+  const parts: Int16Array[] = []
+  let expectedSequence = 0
+  let finalSeen = false
+  for (const event of events) {
+    if (!isRecord(event)) return { ok: false, reason: 'stream event is not an object' }
+    const compat = checkAriaContractVersion(event, supported)
+    if (!compat.compatible) return { ok: false, reason: compat.reason ?? 'incompatible contract' }
+    if (typeof event.sequence !== 'number' || event.sequence !== expectedSequence) {
+      return {
+        ok: false,
+        reason: `synthesis chunk out of order: expected ${expectedSequence}, got ${String(event.sequence)}`,
+      }
+    }
+    expectedSequence += 1
+    const audio = checkAudioPayload(event.audio)
+    if (!audio.ok) return { ok: false, reason: audio.reason }
+    const decoded = decodeAriaPcm(audio.value)
+    if (!decoded.ok) return { ok: false, reason: decoded.reason }
+    if (typeof event.is_final !== 'boolean') {
+      return { ok: false, reason: 'stream event needs a boolean is_final' }
+    }
+    if (event.is_final) {
+      finalSeen = true
+      break
+    }
+    parts.push(decoded.value)
+  }
+  if (!finalSeen) {
+    return { ok: false, reason: 'stream ended without a final event; the audio is incomplete' }
+  }
+  const total = parts.reduce((sum, part) => sum + part.length, 0)
+  const combined = new Int16Array(total)
+  let offset = 0
+  for (const part of parts) {
+    combined.set(part, offset)
+    offset += part.length
+  }
+  return { ok: true, value: combined }
 }
 
 // ---------------------------------------------------------------------------

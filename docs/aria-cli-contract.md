@@ -33,6 +33,10 @@ Repository `aditya-munday/Aria`, branch `feature/phase-4-conversational-ai`:
 | Capabilities | `GET /v1/capabilities`; accents are objects `{tag}` |
 | Chat | `POST /v1/chat` -> `{contract_version, text, route?}` |
 | Chat stream | `POST /v1/chat/stream`; incremental NDJSON deltas; `is_final` ends the stream |
+| Recognition | `POST /v1/stt` -> `{contract_version, text, language?, confidence?}`; audio is `{sample_rate, channels, samples_le_base64}` LE i16 PCM |
+| Recognition stream | `POST /v1/stt/stream`; NDJSON events carry the transcript so far (replace); `is_final` ends the stream |
+| Synthesis | `POST /v1/tts` -> `{contract_version, audio}` |
+| Synthesis stream | `POST /v1/tts/stream`; NDJSON chunks with contiguous zero-based `sequence`; an empty-audio `is_final` frame ends the stream |
 | Error body | flat `{contract_version, code, message}` |
 | Auth | `Authorization: Bearer <user session token>`; the token is never a provider key |
 | Delegation | a `RouteDto {capability, requires_confirmation}` hint; the `DirectionerGateway` port's only production impl is `NotIntegrated` |
@@ -46,6 +50,12 @@ it at `/v1` (`src/modules/aria/routes.ts`).
 chat, and error shapes, and reconstructs a chat stream. A stream with no final
 event is treated as incomplete, mirroring Aria's own rule that an unfinished
 stream is an error rather than a short reply.
+
+It also mirrors the speech surface the backend serves: the PCM audio payload,
+the STT/TTS request and response shapes, and both stream reconstructions.
+Recognition applies replace semantics (each event carries the transcript so
+far); synthesis enforces contiguous zero-based sequences and refuses a stream
+with no final frame, so truncated audio is never presented as complete.
 
 ## Compatibility matrix
 

@@ -53,6 +53,10 @@ function validManifest(): Record<string, unknown> {
   return {
     name: 'directioner',
     version: '1.2.3',
+    license: 'Apache-2.0',
+    private: true,
+    os: ['linux'],
+    cpu: ['x64', 'arm64'],
     bin: { directioner: 'index.js' },
     files: ['index.js', 'launcher.js', 'README.md', 'directioner', 'tree-sitter.wasm'],
     repository: {
@@ -390,6 +394,48 @@ describe('release validator: version consistency', () => {
       expect(check?.ok).toBe(false)
       expect(check?.detail).toContain('4.5.6')
     })
+  })
+})
+
+describe('release validator: platform and license', () => {
+  test('accepts a Linux-only, private, Apache-2.0 package', () => {
+    withPackage(
+      () => {},
+      (dir) => expect(validateRelease(dir).ok).toBe(true),
+    )
+  })
+
+  test('rejects a non-Linux platform list', () => {
+    withPackage(
+      (dir) => {
+        const m = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+        m.os = ['linux', 'darwin', 'win32']
+        writeFileSync(join(dir, 'package.json'), JSON.stringify(m))
+      },
+      (dir) => expect(failingCheckNames(dir)).toContain('package: targets Linux only'),
+    )
+  })
+
+  test('rejects a package that is not marked private', () => {
+    withPackage(
+      (dir) => {
+        const m = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+        delete m.private
+        writeFileSync(join(dir, 'package.json'), JSON.stringify(m))
+      },
+      (dir) => expect(failingCheckNames(dir)).toContain('package: is not publishable'),
+    )
+  })
+
+  test('rejects a non-Apache-2.0 license', () => {
+    withPackage(
+      (dir) => {
+        const m = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+        m.license = 'MIT'
+        writeFileSync(join(dir, 'package.json'), JSON.stringify(m))
+      },
+      (dir) => expect(failingCheckNames(dir)).toContain('package: license declares Apache-2.0'),
+    )
   })
 })
 

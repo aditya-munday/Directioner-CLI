@@ -572,6 +572,45 @@ function validateDocsConsistency(packageDir: string): CheckResult[] {
   ]
 }
 
+// --- Platform and license ------------------------------------------------
+
+/** The product targets Directioner-OS: Linux only, and it is not published. */
+function validatePlatformAndLicense(packageDir: string): CheckResult[] {
+  const readJson = (): Record<string, any> | null => {
+    try {
+      return JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8'))
+    } catch {
+      return null
+    }
+  }
+  return [
+    check('package: targets Linux only', () => {
+      const pkg = readJson()
+      if (pkg === null) return 'package.json is missing or unparseable'
+      const os = Array.isArray(pkg.os) ? pkg.os : []
+      if (os.length === 0) return 'package.json declares no `os` field'
+      const nonLinux = os.filter((o: unknown) => o !== 'linux')
+      return nonLinux.length === 0
+        ? null
+        : `package.json lists non-Linux platforms: ${nonLinux.join(', ')}`
+    }),
+    check('package: is not publishable', () => {
+      const pkg = readJson()
+      if (pkg === null) return 'package.json is missing or unparseable'
+      if (pkg.private === true) return null
+      if (pkg.publishConfig) return 'package.json carries a publishConfig block'
+      return 'package.json is not marked `private`, so it is install-publishable'
+    }),
+    check('package: license declares Apache-2.0', () => {
+      const pkg = readJson()
+      if (pkg === null) return 'package.json is missing or unparseable'
+      return pkg.license === 'Apache-2.0'
+        ? null
+        : `package.json license is "${pkg.license}", expected "Apache-2.0"`
+    }),
+  ]
+}
+
 // --- Driver --------------------------------------------------------------
 
 export function validateRelease(
@@ -601,6 +640,7 @@ export function validateRelease(
     ...validateArchiveIntegrity(packageDir),
     ...validateBinaryIntegrity(packageDir),
     ...validateDocsConsistency(packageDir),
+    ...validatePlatformAndLicense(packageDir),
   ]
 
   const errorsOk = checks.every((c) => c.ok || c.severity === 'warning')

@@ -285,3 +285,21 @@ and provider-neutrality — **not** that a model is good. Do not present a passi
 mock-matrix run as agent-quality evidence. The mock is test-only; keep it so
 (`mock-provider-isolation.test.ts` fails if production source imports it).
 
+## Task execution boundary (CLI side)
+
+`common/src/directioner/` holds the client half of the backend's task execution
+boundary: `shared-task-client.ts` (the `SharedTaskClient` surface),
+`backend-http-client.ts` (real HTTP adapter), `task-executor.ts` (the
+claim/run/report loop), and `task-delegation.ts` (`createBackendExecutor`). The
+agent is injected as an `AgentRunner`; the production runner is
+`sdk/src/directioner/run-sdk-agent.ts`. Honesty rules: lease before run;
+`task.started` only after the lease is held; a result is `inconclusive` unless
+the host proves the effect; a cancellation is confirmed only after the agent
+stops. See `docs/task-execution-boundary.md`.
+
+Test/typecheck: `bun install` then `bun --cwd common test` and
+`bun --cwd common run typecheck`. The directioner tests
+(`common/src/directioner/__tests__/*`) use a real `fetch`/in-memory double, not
+a mocked adapter. A few repo-wide content tests fail on this branch regardless
+of local changes (canonical copy checks) — confirm with `git stash` before
+attributing a failure to your change.

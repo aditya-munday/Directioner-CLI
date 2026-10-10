@@ -11,6 +11,7 @@ import {
   DIRECTIONER_TURN_SPEND_LIMIT_MESSAGE,
 } from '@beyonders/common/constants/directioner-errors'
 import { DIRECTIONER_ACTING_USER_HEADER } from '@beyonders/common/constants/directioner-models'
+import { normalizeHeitalModelId } from '@beyonders/common/constants/directioner-heital-models'
 import { isTransientNetworkError } from '@beyonders/common/util/error'
 import {
   OpenAICompatibleChatLanguageModel,
@@ -143,6 +144,73 @@ export function redactProviderStream(
     },
     cancel() { return reader.cancel().catch(() => {}) },
   })
+}
+
+/**
+ * Build the fetch a provider request runs on, with the transport guards applied
+ * uniformly to every protocol.
+ *
+ * Three properties, identical for the OpenAI-compatible and native branches:
+ *
+ *   - redirects are refused. `redirect: 'error'` stops a provider that answers
+ *     3xx from forwarding the request — bearer token or `x-api-key` included —
+ *     to a host the user never configured. The OpenAI-compatible branch had
+ *     this; the native Anthropic branch did not, so a Claude endpoint could
+ *     still redirect the key.
+ *   - the credential is redacted from the response stream, including when it is
+ *     split across chunks. Gateways echo key fragments in error bodies; without
+ *     this the native branch could surface them.
+ *   - revocation is re-checked before every attempt (including retries and
+ *     later tool-loop steps), so removing or replacing a connection stops the
+ *     next inference.
+ *
+ * `onErrorResponse` lets a caller rewrite a non-2xx body — the OpenAI-compatible
+ * branch normalizes model-id rejections — while the native branch keeps the
+ * provider's own error shape for its SDK to parse.
+ */
+export function createProviderFetch(
+  apiKey: string,
+  options: {
+    assertCurrent?: () => Promise<void>
+    onErrorResponse?: (
+      response: Response,
+    ) => Promise<Response | undefined> | Response | undefined
+    networkErrorMessage?: string
+  } = {},
+): typeof globalThis.fetch {
+  return (async (...args: Parameters<typeof globalThis.fetch>) => {
+    // A revocation check is a local decision, not a network failure: keep it
+    // outside the try/catch so "connection removed/replaced" reaches the caller
+    // with its own message rather than the network copy.
+    await options.assertCurrent?.()
+    let response: Response
+    try {
+      response = await globalThis.fetch(args[0], {
+        ...(args[1] ?? {}),
+        redirect: 'error',
+      })
+    } catch (cause) {
+      if (options.networkErrorMessage) {
+        throw new Error(options.networkErrorMessage, { cause })
+      }
+      throw cause
+    }
+    let effective = response
+    if (!response.ok) {
+      const rewritten = await options.onErrorResponse?.(response)
+      effective = rewritten ?? response
+    }
+    // Redact the body for successes AND failures: a non-2xx body is where a
+    // gateway most often echoes a credential fragment, so leaving it unredacted
+    // would defeat the guard exactly where it matters.
+    return new Response(redactProviderStream(effective.body, apiKey), {
+      status: effective.status,
+      headers: {
+        'content-type':
+          effective.headers.get('content-type') ?? 'application/json',
+      },
+    })
+  }) as typeof globalThis.fetch
 }
 
 /**
@@ -307,12 +375,28 @@ export function getModelForRequest({
       const anthropic = createAnthropic({
         apiKey: byok.apiKey,
         baseURL: byokProviderBaseUrl(byok),
+        // Same redirect refusal, key redaction and revocation re-check as the
+        // OpenAI-compatible branch. Without the custom fetch this branch sent
+        // the key through a plain fetch that would follow a redirect to an
+        // arbitrary host, and it did not scrub the key from error streams.
+        fetch: createProviderFetch(byok.apiKey, {
+          assertCurrent: byok.assertCurrent,
+        }),
       })
       return anthropic(byok.model)
     }
     return new OpenAICompatibleChatLanguageModel(byok.model, {
       provider: 'byok',
-      transformRequestBody: byokRequestTransform(byok),
+      transformRequestBody: (body: Record<string, unknown>) => {
+        const transformed = byokRequestTransform(byok)(body)
+        // Heital (Gemini) speaks OpenAI's wire format but Google's own model ids.
+        // A catalog id like `google/gemini-3.8-flash` normalizes to
+        // `gemini-3.8-flash`; other providers and unknown ids pass through.
+        if (byok.provider === 'heital' && typeof transformed.model === 'string') {
+          return { ...transformed, model: normalizeHeitalModelId(transformed.model) }
+        }
+        return transformed
+      },
       url: () => byokCompletionUrl(byok),
       headers: () => ({
         Authorization: `Bearer ${byok.apiKey}`,
@@ -321,23 +405,10 @@ export function getModelForRequest({
       // Check the durable revision before every provider attempt. The AI SDK
       // invokes this again on retries and later tool-loop steps, so removing
       // or replacing a connection stops subsequent inference immediately.
-      fetch: (async (...args: Parameters<typeof globalThis.fetch>) => {
-        // A revocation check is a local decision, not a network failure: keep
-        // it outside the try/catch so "connection removed/replaced" reaches the
-        // caller with its own message instead of the network copy.
-        await byok.assertCurrent?.()
-        let response: Response
-        try {
-          response = await globalThis.fetch(
-            args[0],
-            { ...(args[1] ?? {}), redirect: 'error' },
-          )
-        } catch (cause) {
-          // Preserve the underlying cause (ECONNREFUSED/DNS/TLS) so the failure
-          // is diagnosable, while the message stays user-facing and key-free.
-          throw new Error(BYOK_CONNECTION_FAILURE_MESSAGE, { cause })
-        }
-        if (!response.ok) {
+      fetch: createProviderFetch(byok.apiKey, {
+        assertCurrent: byok.assertCurrent,
+        networkErrorMessage: BYOK_CONNECTION_FAILURE_MESSAGE,
+        onErrorResponse: async (response) => {
           const modelRejected =
             response.status === 400 ||
             response.status === 404 ||
@@ -355,14 +426,8 @@ export function getModelForRequest({
             }),
             { status: response.status, headers: { 'content-type': 'application/json' } },
           )
-        }
-        return new Response(redactProviderStream(response.body, byok.apiKey), {
-          status: response.status,
-          headers: {
-            'content-type': response.headers.get('content-type') ?? 'text/event-stream',
-          },
-        })
-      }) as typeof globalThis.fetch,
+        },
+      }),
       includeUsage: true,
       supportsStructuredOutputs: true,
     })

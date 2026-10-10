@@ -294,25 +294,81 @@ describe('shared task model: approvals bind to task, operation, and scope', () =
   }
 
   test('a matching binding is accepted', () => {
-    expect(assertApprovalBinding(approval, 'task_1', 'op_1', 'service:nginx.service').ok).toBe(true)
+    expect(assertApprovalBinding(approval, 'task_1', 'op_1', 'service:nginx.service', { now: NOW }).ok).toBe(true)
   })
 
   test('an approval cannot be replayed onto another task', () => {
-    const result = assertApprovalBinding(approval, 'task_2', 'op_1', 'service:nginx.service')
+    const result = assertApprovalBinding(approval, 'task_2', 'op_1', 'service:nginx.service', { now: NOW })
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.reason).toBe('wrong_task')
   })
 
   test('an approval cannot authorize a different operation', () => {
-    const result = assertApprovalBinding(approval, 'task_1', 'op_2', 'service:nginx.service')
+    const result = assertApprovalBinding(approval, 'task_1', 'op_2', 'service:nginx.service', { now: NOW })
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.reason).toBe('wrong_operation')
   })
 
   test('an approval cannot be widened beyond its scope', () => {
-    const result = assertApprovalBinding(approval, 'task_1', 'op_1', 'service:everything')
+    const result = assertApprovalBinding(approval, 'task_1', 'op_1', 'service:everything', { now: NOW })
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.reason).toBe('scope_mismatch')
+  })
+
+  test('a pending approval does not authorize', () => {
+    const pending: ApprovalRecord = { ...approval, decision: 'denied', decidedAt: '' }
+    const result = assertApprovalBinding(
+      pending,
+      'task_1',
+      'op_1',
+      'service:nginx.service',
+      { now: NOW },
+    )
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toBe('not_granted')
+  })
+
+  test('a granted approval past its expiry does not authorize', () => {
+    const result = assertApprovalBinding(
+      approval,
+      'task_1',
+      'op_1',
+      'service:nginx.service',
+      { now: '2026-10-10T09:00:00.000Z' },
+    )
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toBe('expired')
+  })
+
+  test('the expiry check uses the clock, not the approval', () => {
+    // A forged `expiresAt` cannot keep a stale approval alive if the caller's
+    // trusted clock has moved past it.
+    const extended: ApprovalRecord = {
+      ...approval,
+      expiresAt: '2099-01-01T00:00:00.000Z',
+    }
+    expect(
+      assertApprovalBinding(extended, 'task_1', 'op_1', 'service:nginx.service', {
+        now: '2100-01-01T00:00:00.000Z',
+      }).ok,
+    ).toBe(false)
+  })
+
+  test('an approval valid at the clock is accepted', () => {
+    expect(
+      assertApprovalBinding(approval, 'task_1', 'op_1', 'service:nginx.service', {
+        now: '2026-10-10T08:04:59.000Z',
+      }).ok,
+    ).toBe(true)
+  })
+
+  test('an approval with no expiry is not treated as already expired', () => {
+    const noExpiry: ApprovalRecord = { ...approval, expiresAt: '' }
+    expect(
+      assertApprovalBinding(noExpiry, 'task_1', 'op_1', 'service:nginx.service', {
+        now: '2099-01-01T00:00:00.000Z',
+      }).ok,
+    ).toBe(true)
   })
 
   test('text is never an approval', () => {

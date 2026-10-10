@@ -438,19 +438,51 @@ export function applyVerification(
 
 export type ApprovalBindingResult =
   | { ok: true }
-  | { ok: false; reason: 'wrong_task' | 'wrong_operation' | 'scope_mismatch' }
+  | {
+      ok: false
+      reason:
+        | 'wrong_task'
+        | 'wrong_operation'
+        | 'scope_mismatch'
+        | 'not_granted'
+        | 'expired'
+    }
+
+/**
+ * A clock the caller must supply from trusted state — its own wall clock, never
+ * a timestamp carried inside the event or approval being judged. If the gate
+ * read `approval.expiresAt` against a "now" the input could set, the input
+ * could keep a stale approval alive indefinitely.
+ */
+export interface TrustedClock {
+  now: string
+}
+
+function isAfter(instant: string, reference: string): boolean {
+  const a = Date.parse(instant)
+  const b = Date.parse(reference)
+  if (Number.isNaN(a) || Number.isNaN(b)) return false
+  return a > b
+}
 
 /**
  * Whether an approval record authorizes a specific operation on a specific
  * task. An approval issued for task A cannot be presented for task B, and one
  * issued for operation X cannot authorize operation Y. This is the client-side
  * half of the same rule the operation boundary enforces.
+ *
+ * `clock` is required so the expiry check uses the caller's trusted wall clock,
+ * not a timestamp an attacker could put in the approval. An approval that was
+ * never granted does not authorize, and neither does one whose `expiresAt` has
+ * passed. Callers that predate the clock can read `approval.expiresAt` and pass
+ * the same string they would have used.
  */
 export function assertApprovalBinding(
   approval: ApprovalRecord,
   taskId: TaskId,
   operationId: OperationId,
   scope: string,
+  clock: TrustedClock,
 ): ApprovalBindingResult {
   if (approval.taskId !== taskId) {
     return { ok: false, reason: 'wrong_task' }
@@ -460,6 +492,16 @@ export function assertApprovalBinding(
   }
   if (approval.scope !== scope) {
     return { ok: false, reason: 'scope_mismatch' }
+  }
+  // An approval is only authority once the user granted it. A pending request,
+  // or one policy denied, is not authorization.
+  if (approval.decision !== 'granted') {
+    return { ok: false, reason: 'not_granted' }
+  }
+  // Expiry: time outranks the grant. A granted approval past `expiresAt` is
+  // spent, however it is presented.
+  if (approval.expiresAt && isAfter(clock.now, approval.expiresAt)) {
+    return { ok: false, reason: 'expired' }
   }
   return { ok: true }
 }

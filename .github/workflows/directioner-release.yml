@@ -30,6 +30,7 @@ on:
       - 'directioner/**'
       - 'scripts/validate-release.ts'
       - 'scripts/package-manifest.ts'
+      - 'scripts/bench-directioner.ts'
       - 'scripts/test-release-artifact.ts'
       - 'scripts/test-binary-offline.ts'
       - 'scripts/test-validator-failures.ts'
@@ -95,6 +96,21 @@ jobs:
 
       - name: Directioner unit tests
         run: bun test cli/src/__tests__/release/ cli/src/__tests__/terminal-reset-sequences.test.ts
+
+      # Informational, not a gate: shared CI runners are noisy and a perf gate
+      # that trips on that noise gets ignored. This records today's numbers as a
+      # downloadable artifact so a regression can be seen in context. The gate
+      # is a local run against a baseline saved with `--save` on the same
+      # machine, since timings are not comparable across hardware.
+      - name: Benchmark local hot paths
+        run: bun scripts/bench-directioner.ts --json > directioner-perf.json
+
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: directioner-perf
+          path: directioner-perf.json
+          retention-days: 14
 
       - name: Directioner e2e tests
         run: bun test directioner/

@@ -54,6 +54,7 @@ import {
   formatDoctorReport,
   runDirectionerDoctor,
 } from './utils/directioner-doctor'
+import { runSystemDiagnostics } from './utils/directioner-system-diagnostics'
 import { getCliEnv } from './utils/env'
 import { initializeAgentRegistry } from './utils/local-agent-registry'
 import { trimOversizedChatLogs } from './utils/chat-history'
@@ -256,6 +257,7 @@ async function main(): Promise<void> {
     provider,
     doctor,
     ping,
+    systemDiagnostics,
   } = parseArgs()
 
   const isLoginCommand = command === 'login'
@@ -266,6 +268,22 @@ async function main(): Promise<void> {
 
   if (IS_DIRECTIONER) {
     if (provider) setDirectionerProviderOverride(provider)
+
+    // `--system-diagnostics` is a read-only report about the machine itself
+    // (kernel, modules, boot/services, devices). It runs before any provider
+    // check because it needs no config and no network, and it is the surface
+    // the Directioner-OS capability work builds on.
+    if (systemDiagnostics) {
+      const report = await runSystemDiagnostics()
+      const output = report.lines.join('\n')
+      if (report.ok) {
+        console.log(output)
+      } else {
+        console.error(output)
+        process.exitCode = 1
+      }
+      return
+    }
 
     // `--doctor` is a pre-flight report: it prints the provider, model,
     // endpoint and credential status (never the secret) and exits, so a user

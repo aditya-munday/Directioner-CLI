@@ -352,6 +352,46 @@ describe('service and module state', () => {
     expect(result.errorClass).toBe('missing_source')
   })
 
+  test('systemctl prose on a non-systemd host is unavailable, never failed units', async () => {
+    const prose =
+      "System has not been booted with systemd as init system (PID 1). Can't operate.\nFailed to connect to system scope bus via local transport: Host is down\n"
+    const env = makeEnv({
+      files: { '/usr/bin/systemctl': 'x' },
+      runs: { [EXE.systemctl]: okRun(prose) },
+    })
+    const result = await diagnoseBootState(env)
+    expect(result.status).toBe('unavailable')
+    expect(result.data).toBeNull()
+    expect(result.findings).toEqual([])
+  })
+
+  test('systemctl prose is unavailable for a single-unit status too', async () => {
+    const env = makeEnv({
+      files: { '/usr/bin/systemctl': 'x' },
+      runs: {
+        [EXE.systemctl]: okRun(
+          'Failed to connect to bus: No such file or directory\n',
+        ),
+      },
+    })
+    const result = await diagnoseServiceStatus(env, 'nginx.service')
+    expect(result.status).toBe('unavailable')
+  })
+
+  test('a real failed-unit row is still parsed', async () => {
+    const env = makeEnv({
+      files: { '/usr/bin/systemctl': 'x' },
+      runs: {
+        [EXE.systemctl]: okRun(
+          'nginx.service loaded failed failed A high performance web server\n',
+        ),
+      },
+    })
+    const result = await diagnoseBootState(env)
+    expect(result.status).toBe('ok')
+    expect(result.data?.failedUnits.map((u) => u.unit)).toEqual(['nginx.service'])
+  })
+
   test('unexpected /proc/modules line shape does not crash or invent modules', async () => {
     const env = makeEnv({
       files: { '/proc/modules': 'garbage\n\nfoo 1234 0 - Live 0x0\n' },

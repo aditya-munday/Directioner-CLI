@@ -735,6 +735,13 @@ export async function diagnoseBootState(
   if (!run.ok) {
     return failure(env, base, run.errorClass, run.limitation)
   }
+  if (systemdUnavailable(run.text)) {
+    return unavailable(
+      env,
+      base,
+      'systemctl is present but systemd is not the init system here (container/chroot); boot state unavailable',
+    )
+  }
   const failedUnits = parseSystemctlFailed(run.text)
   return {
     ...base,
@@ -770,16 +777,17 @@ function parseSystemctlFailed(text: string): FailedUnit[] {
     const trimmed = line.trim()
     if (!trimmed) continue
     const cols = trimmed.split(/\s+/)
-    // `--plain` gives: UNIT LOAD ACTIVE SUB DESCRIPTION...
     if (cols.length < 4) continue
     const [unit, loadState, activeState, subState, ...rest] = cols
-    units.push({
-      unit,
-      loadState,
-      activeState,
-      subState,
-      description: rest.join(' '),
-    })
+    // A real row has a unit name (dot-suffixed), a known load state, and a
+    // known active state. A prose line that happens to have four words is
+    // rejected rather than turned into a unit.
+    if (!/^[^\s]+\.(service|socket|timer|target|mount|device|path|slice|scope)$/.test(unit)) {
+      continue
+    }
+    if (!SYSTEMD_LOAD_STATES.has(loadState)) continue
+    if (!SYSTEMD_ACTIVE_STATES.has(activeState)) continue
+    units.push({ unit, loadState, activeState, subState, description: rest.join(' ') })
   }
   return units
 }
@@ -844,6 +852,13 @@ export async function diagnoseServiceStatus(
   )
   if (!run.ok) {
     return failure(env, base, run.errorClass, run.limitation)
+  }
+  if (systemdUnavailable(run.text)) {
+    return unavailable(
+      env,
+      base,
+      'systemctl is present but systemd is not the init system here (container/chroot); service status unavailable',
+    )
   }
   const props = parseProperties(run.text)
   if (!props.LoadState) {
@@ -1084,8 +1099,44 @@ export async function diagnosePackageInfo(
 // ---------------------------------------------------------------------------
 
 type GuardedRun =
-  | { ok: true; text: string; truncated: boolean }
+  | { ok: true; text: string; truncated: boolean; status: number | null }
   | { ok: false; errorClass: DiagnosticErrorClass; limitation: string }
+
+/**
+ * Lines `systemctl` prints when it is present but cannot reach systemd (a
+ * container without an init, a chroot, a down system bus). These are *prose*,
+ * not unit rows; treating them as units invents failures, so they are detected
+ * and reported as the capability gap they are.
+ */
+const SYSTEMCTL_NO_SYSTEMD = [
+  /has not been booted with systemd/i,
+  /Failed to connect to system scope bus/i,
+  /System has not been booted/i,
+  /Failed to connect to bus/i,
+]
+
+function systemdUnavailable(text: string): boolean {
+  return SYSTEMCTL_NO_SYSTEMD.some((re) => re.test(text))
+}
+
+/** Load states `systemctl --plain` reports in column 2. */
+const SYSTEMD_LOAD_STATES = new Set([
+  'loaded',
+  'not-found',
+  'masked',
+  'error',
+  'bad-setting',
+])
+/** Active states reported in column 3. */
+const SYSTEMD_ACTIVE_STATES = new Set([
+  'active',
+  'inactive',
+  'failed',
+  'activating',
+  'deactivating',
+  'reloading',
+  'maintenance',
+])
 
 /**
  * Run an allowlisted executable with fixed args, mapping the environment's
@@ -1134,6 +1185,7 @@ async function runGuarded(
     ok: true,
     text: `${outcome.stdout}${outcome.stderr ? `\n${outcome.stderr}` : ''}`,
     truncated: outcome.truncated,
+    status: outcome.status,
   }
 }
 

@@ -65,7 +65,14 @@ export interface TaskExecution {
 }
 
 /** Why a claim was refused. */
-export type ClaimRefusal = 'terminal' | 'not_dispatched' | 'lease_held'
+export type ClaimRefusal =
+  | 'terminal'
+  | 'not_dispatched'
+  | 'lease_held'
+  /** The task's cancellation was requested; it is never (re)started. */
+  | 'cancellation_requested'
+  /** A cancellation was attempted but the stop was never observed. */
+  | 'cancellation_unconfirmed'
 
 export interface ClaimResult {
   execution: TaskExecution

@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "taskStatus": [
+    "draft",
+    "awaiting_approval",
+    "approved",
+    "running",
+    "succeeded",
+    "failed",
+    "cancelled"
+  ],
+  "executionState": [
+    "pending",
+    "leased",
+    "running",
+    "completed",
+    "failed",
+    "cancelled"
+  ],
+  "terminalExecutionState": [
+    "completed",
+    "failed",
+    "cancelled"
+  ],
+  "cancellationState": [
+    "none",
+    "requested",
+    "confirmed",
+    "unknown",
+    "failed"
+  ],
+  "verificationState": [
+    "unverified",
+    "confirmed",
+    "not_confirmed",
+    "inconclusive"
+  ],
+  "claimRefusal": [
+    "terminal",
+    "not_dispatched",
+    "lease_held",
+    "cancellation_requested",
+    "cancellation_unconfirmed"
+  ],
+  "taskEventType": [
+    "task.created",
+    "task.started",
+    "task.recovered",
+    "task.completed",
+    "task.failed",
+    "task.cancelled",
+    "cancellation.requested",
+    "tool.completed",
+    "approval.requested",
+    "approval.granted",
+    "approval.denied",
+    "verification.recorded",
+    "security.event"
+  ]
+}

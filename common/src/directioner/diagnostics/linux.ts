@@ -1095,6 +1095,137 @@ export async function diagnosePackageInfo(
 }
 
 // ---------------------------------------------------------------------------
+// OS capability probe — what this host can actually be inspected for
+// ---------------------------------------------------------------------------
+
+/** One capability and whether this host provides it. */
+export interface OsCapability {
+  /** Stable id, e.g. `procfs`, `systemd`, `journal`, `pci`, `dpkg`. */
+  id: string
+  /** The diagnostics that require it. */
+  enables: string[]
+  available: boolean
+  /** Why it is unavailable, when it is. */
+  reason: string | null
+}
+
+export interface OsCapabilitiesData {
+  platform: string
+  arch: string
+  capabilities: OsCapability[]
+  /** Ids of the capabilities that are available. */
+  available: string[]
+}
+
+/**
+ * Probe which inspection capabilities this host has, without reading anything
+ * large: does procfs exist, is systemd the init system, is an allowlisted
+ * binary present. This is the machine-checkable form of the compatibility
+ * matrix in `docs/directioner-os-cli-compatibility.md`, so a report can state
+ * up front what it will and will not be able to say.
+ *
+ * It answers "can I look?" (a filesystem/binary presence check), not "what did
+ * I see?" — so it is cheap and never elevates.
+ */
+export async function diagnoseOsCapabilities(
+  env: DiagnosticEnvironment,
+  signal?: AbortSignal,
+): Promise<DiagnosticResult<OsCapabilitiesData>> {
+  const source: EvidenceProvenance = { source: '/proc', kind: 'derived' }
+  const base: BaseFields = {
+    id: 'os.capabilities',
+    domain: 'kernel',
+    subject: 'host',
+    source,
+  }
+  if (!isLinux(env)) {
+    return unavailable(env, base, 'OS capability probing is Linux-only')
+  }
+
+  const cap = (
+    id: string,
+    enables: string[],
+    available: boolean,
+    reason: string | null,
+  ): OsCapability => ({ id, enables, available, reason })
+
+  const procModules = env.exists('/proc/modules')
+  const sysBus = env.exists('/sys/bus/pci/devices')
+  const hasSystemctl = env.exists(DIAGNOSTIC_EXECUTABLES.systemctl)
+  const hasJournalctl = env.exists(DIAGNOSTIC_EXECUTABLES.journalctl)
+  const hasLspci = env.exists(DIAGNOSTIC_EXECUTABLES.lspci)
+  const hasLsusb = env.exists(DIAGNOSTIC_EXECUTABLES.lsusb)
+  const hasModinfo = env.exists(DIAGNOSTIC_EXECUTABLES.modinfo)
+  const hasDpkg = env.exists(DIAGNOSTIC_EXECUTABLES.dpkg)
+  const hasRpm = env.exists(DIAGNOSTIC_EXECUTABLES.rpm)
+
+  // systemd presence is only provable by asking systemctl; if it is present,
+  // run the bounded capability check once.
+  let systemdReachable = false
+  let systemdReason: string | null = null
+  if (hasSystemctl) {
+    const probe = await runGuarded(
+      env,
+      'systemctl',
+      ['is-system-running'],
+      signal,
+    )
+    if (!probe.ok) {
+      systemdReason = `systemctl present but not runnable: ${probe.limitation}`
+    } else if (systemdUnavailable(probe.text)) {
+      systemdReason = 'systemctl present but systemd is not the init system'
+    } else {
+      // `is-system-running` prints a single state word; `offline`/`unknown`
+      // mean systemd is not actually reachable even though the binary ran.
+      const state = probe.text.trim().split('\n')[0].trim().toLowerCase()
+      if (SYSTEMD_REACHABLE_STATES.has(state)) {
+        systemdReachable = true
+      } else {
+        systemdReason = `systemd reported '${state}', not a running init system`
+      }
+    }
+  } else {
+    systemdReason = 'systemctl is not installed'
+  }
+
+  const capabilities: OsCapability[] = [
+    cap('procfs', ['kernel.modules'], procModules, procModules ? null : '/proc/modules not present'),
+    cap('sysfs', ['driver.binding'], sysBus, sysBus ? null : '/sys/bus/pci/devices not present'),
+    cap('systemd', ['boot.state', 'service.status'], systemdReachable, systemdReason),
+    cap('journal', ['kernel.log'], hasJournalctl, hasJournalctl ? null : 'journalctl not installed'),
+    cap('pci', ['hardware.pci'], hasLspci, hasLspci ? null : 'lspci not installed'),
+    cap('usb', ['hardware.usb'], hasLsusb, hasLsusb ? null : 'lsusb not installed'),
+    cap('modinfo', ['kernel.module.info'], hasModinfo, hasModinfo ? null : 'modinfo not installed'),
+    cap('dpkg', ['package.info'], hasDpkg, hasDpkg ? null : 'dpkg-query not installed'),
+    cap('rpm', ['package.info'], hasRpm, hasRpm ? null : 'rpm not installed'),
+  ]
+  const available = capabilities.filter((c) => c.available).map((c) => c.id)
+  const missing = capabilities.filter((c) => !c.available)
+
+  return {
+    ...base,
+    observedAt: env.now(),
+    status: 'ok',
+    data: {
+      platform: env.platform,
+      arch: env.arch,
+      capabilities,
+      available,
+    },
+    findings: [
+      {
+        code: 'os.capabilities.available',
+        message: `${available.length}/${capabilities.length} inspection capabilities available: ${available.join(', ')}`,
+        severity: missing.length === 0 ? 'info' : 'warning',
+      },
+    ],
+    warnings: missing.map((c) => `${c.id}: ${c.reason}`),
+    errorClass: null,
+    limitations: missing.map((c) => `${c.id} unavailable: ${c.reason}`),
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Guarded command runner
 // ---------------------------------------------------------------------------
 
@@ -1136,6 +1267,20 @@ const SYSTEMD_ACTIVE_STATES = new Set([
   'deactivating',
   'reloading',
   'maintenance',
+])
+
+/**
+ * Outputs of `systemctl is-system-running` that mean systemd is actually the
+ * running init system. `offline` and `unknown` mean it is not reachable (a
+ * container, a chroot, a down bus) even though the binary answered.
+ */
+const SYSTEMD_REACHABLE_STATES = new Set([
+  'running',
+  'degraded',
+  'maintenance',
+  'starting',
+  'stopping',
+  'reloading',
 ])
 
 /**

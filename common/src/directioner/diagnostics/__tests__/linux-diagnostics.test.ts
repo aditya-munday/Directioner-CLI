@@ -12,6 +12,7 @@ import {
   diagnoseModuleInfo,
   diagnosePackageInfo,
   diagnoseServiceStatus,
+  diagnoseOsCapabilities,
   isValidPackageName,
   isValidSubject,
 } from '../linux'
@@ -452,6 +453,68 @@ describe('redaction', () => {
     expect(redactDiagnosticText(input).text).toBe(
       redactDiagnosticText(input).text,
     )
+  })
+})
+
+describe('OS capability probe', () => {
+  test('reports which capabilities this host has, with reasons for the rest', async () => {
+    const env = makeEnv({
+      files: { '/usr/bin/uname': 'x', '/proc/modules': 'm 1 0 - Live 0x0\n' },
+      dirs: { '/sys/bus/pci/devices': [] },
+    })
+    const result = await diagnoseOsCapabilities(env)
+    expect(result.status).toBe('ok')
+    const byId = Object.fromEntries(
+      (result.data?.capabilities ?? []).map((c) => [c.id, c]),
+    )
+    expect(byId.procfs.available).toBe(true)
+    expect(byId.sysfs.available).toBe(true)
+    // systemctl is not in `files`/`dirs`, so systemd is unavailable with a reason.
+    expect(byId.systemd.available).toBe(false)
+    expect(byId.systemd.reason).toContain('not installed')
+    expect(result.limitations.length).toBeGreaterThan(0)
+  })
+
+  test('systemctl present but non-systemd host is reported as unavailable systemd', async () => {
+    const env = makeEnv({
+      files: { '/usr/bin/systemctl': 'x' },
+      runs: {
+        [EXE.systemctl]: okRun(
+          "System has not been booted with systemd as init system (PID 1). Can't operate.\n",
+        ),
+      },
+    })
+    const result = await diagnoseOsCapabilities(env)
+    const systemd = result.data?.capabilities.find((c) => c.id === 'systemd')
+    expect(systemd?.available).toBe(false)
+    expect(systemd?.reason).toContain('not the init system')
+  })
+
+  test("systemctl 'offline' is not counted as reachable systemd", async () => {
+    const env = makeEnv({
+      files: { '/usr/bin/systemctl': 'x' },
+      runs: { [EXE.systemctl]: okRun('offline\n') },
+    })
+    const result = await diagnoseOsCapabilities(env)
+    const systemd = result.data?.capabilities.find((c) => c.id === 'systemd')
+    expect(systemd?.available).toBe(false)
+    expect(systemd?.reason).toContain('offline')
+  })
+
+  test("systemctl 'running' is counted as reachable systemd", async () => {
+    const env = makeEnv({
+      files: { '/usr/bin/systemctl': 'x' },
+      runs: { [EXE.systemctl]: okRun('running\n') },
+    })
+    const result = await diagnoseOsCapabilities(env)
+    const systemd = result.data?.capabilities.find((c) => c.id === 'systemd')
+    expect(systemd?.available).toBe(true)
+  })
+
+  test('non-Linux host reports unavailable', async () => {
+    const env = makeEnv({ platform: 'darwin' })
+    const result = await diagnoseOsCapabilities(env)
+    expect(result.status).toBe('unavailable')
   })
 })
 

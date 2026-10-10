@@ -18,6 +18,7 @@ export {
   diagnoseServiceStatus,
   diagnoseKernelLog,
   diagnosePackageInfo,
+  diagnoseOsCapabilities,
 } from './linux'
 export type {
   DiagnosticExecutable,
@@ -35,6 +36,8 @@ export type {
   ServiceStatusData,
   KernelLogData,
   PackageInfoData,
+  OsCapability,
+  OsCapabilitiesData,
 } from './linux'
 export { redactDiagnosticText, REDACTED } from './redaction'
 export type { RedactionOutcome, RedactionRecord } from './redaction'

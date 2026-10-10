@@ -19,6 +19,7 @@ import {
   diagnoseKernelArch,
   diagnoseKernelModules,
   diagnoseKernelRelease,
+  diagnoseOsCapabilities,
 } from '@beyonders/common/directioner/diagnostics'
 
 import type {
@@ -60,6 +61,10 @@ export async function runSystemDiagnostics(
   const unavailable: SystemDiagnosticsReport['unavailable'] = []
   let ok = true
 
+  const capabilities = await diagnoseOsCapabilities(env, options.signal)
+  lines.push(renderCapabilities(capabilities))
+  lines.push('')
+
   const results: DiagnosticResult<unknown>[] = [
     await diagnoseKernelRelease(env, options.signal),
     await diagnoseKernelArch(env, options.signal),
@@ -93,6 +98,25 @@ export async function runSystemDiagnostics(
   }
 
   return { lines, ok, unavailable }
+}
+
+function renderCapabilities(result: DiagnosticResult<unknown>): string {
+  if (result.status !== 'ok' || !result.data) {
+    return `### os.capabilities\n  source: ${result.source.kind} ${result.source.source}\n    - (${result.status}${result.errorClass ? `: ${result.errorClass}` : ''})`
+  }
+  const data = result.data as {
+    capabilities: Array<{ id: string; available: boolean; reason: string | null }>
+  }
+  const rows = data.capabilities
+    .map((c) =>
+      c.available ? `    - [ok] ${c.id}` : `    - [--] ${c.id} (${c.reason})`,
+    )
+    .join('\n')
+  return [
+    '### os.capabilities',
+    `  source: ${result.source.kind} ${result.source.source}`,
+    rows,
+  ].join('\n')
 }
 
 function renderResult(result: DiagnosticResult<unknown>): string {

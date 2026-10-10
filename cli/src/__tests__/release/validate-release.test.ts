@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url'
 import {
   detectBinaryFormat,
   scanForSecrets,
+  stripApprovedDocumentationReferences,
   validateRelease,
 } from '../../../../scripts/validate-release'
 
@@ -389,5 +390,70 @@ describe('release validator: version consistency', () => {
       expect(check?.ok).toBe(false)
       expect(check?.detail).toContain('4.5.6')
     })
+  })
+})
+
+describe('release validator: approved documentation references', () => {
+  const POLICY = 'https://directioner.com/privacy-policy'
+
+  test('allows the canonical privacy-policy URL in a package README', () => {
+    withPackage(
+      (dir) =>
+        writeFileSync(
+          join(dir, 'README.md'),
+          `# Directioner\n\nConfigure a provider and set your API key.\n\nSee the [Privacy Policy](${POLICY}) for complete details.\n`,
+        ),
+      (dir) =>
+        expect(failingCheckNames(dir)).not.toContain(
+          'legacy: package files carry no vendor references',
+        ),
+    )
+  })
+
+  test('still rejects the same token in executable code', () => {
+    withPackage(
+      (dir) =>
+        writeFileSync(
+          join(dir, 'launcher.js'),
+          `module.exports = { createLauncher() {} }\nconst HOST = 'https://directioner.com/privacy-policy'\n`,
+        ),
+      (dir) =>
+        expect(failingCheckNames(dir)).toContain(
+          'legacy: package files carry no vendor references',
+        ),
+    )
+  })
+
+  test('rejects a broadened URL that only prefixes the approved one', () => {
+    withPackage(
+      (dir) =>
+        writeFileSync(
+          join(dir, 'README.md'),
+          `# Directioner\n\nConfigure a provider and set your API key.\n\nDownload: ${POLICY}/download\n`,
+        ),
+      (dir) =>
+        expect(failingCheckNames(dir)).toContain(
+          'legacy: package files carry no vendor references',
+        ),
+    )
+  })
+
+  test('strip helper is exact, complete-URL, and file-scoped', () => {
+    const withUrl = `x ${POLICY} y`
+    expect(stripApprovedDocumentationReferences(withUrl, 'README.md')).not.toContain(
+      'directioner.com',
+    )
+    expect(
+      stripApprovedDocumentationReferences(`${POLICY}/download`, 'README.md'),
+    ).toContain('directioner.com')
+    expect(stripApprovedDocumentationReferences(withUrl, 'launcher.js')).toContain(
+      'directioner.com',
+    )
+    expect(
+      stripApprovedDocumentationReferences(
+        'https://directioner.com/api/releases',
+        'README.md',
+      ),
+    ).toContain('directioner.com')
   })
 })

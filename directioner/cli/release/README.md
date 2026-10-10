@@ -71,6 +71,18 @@ same guidance.
 Directioner-CLI ships a **Linux** (Directioner-OS) ELF executable. There is no
 Windows or macOS customer build.
 
+## Data use
+
+<!-- BEGIN GENERATED DIRECTIONER DATA USE -->
+
+**Is my data used to train AI?** Only when a model or feature says data may be used for AI training. Directioner or the provider may then keep submissions to develop, train, test, evaluate, fine-tune, and improve AI models or products.
+
+**How is my data used and stored?** We use prompts, messages, agent traces, code, files, and repository data to provide Directioner. We do not give separately uploaded files or connected repositories to third parties. Restricted partners may evaluate connected Cloud repositories, but cannot otherwise use, broadly share, or train on them. See the Privacy Policy for retention, eligibility, and data choices.
+
+See the [Privacy Policy](https://directioner.com/privacy-policy) for complete details.
+
+<!-- END GENERATED DIRECTIONER DATA USE -->
+
 ## Links
 
 - [Documentation](https://github.com/aditya-munday/Directioner-CLI)

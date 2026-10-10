@@ -67,6 +67,68 @@ const FORBIDDEN_PACKAGE_TOKENS = [
 ]
 
 /**
+ * Approved documentation references — forbidden tokens that are permitted in a
+ * specific, first-party documentation file as an exact, complete URL.
+ *
+ * WHY THIS EXISTS
+ *
+ * The vendor-token rule used to conflate two different things: a harmless,
+ * required *documentation* link (the canonical privacy-policy URL that the
+ * data-use disclosure must carry) and a forbidden *runtime* endpoint. The
+ * disclosure failed the gate.
+ *
+ * The allowance is deliberately narrow:
+ *  - it names the exact approved URL string, not the token;
+ *  - it applies only in the named documentation files (matched by basename);
+ *  - it strips the reference only when the URL is complete, so a runtime
+ *    endpoint, a broadened URL (`…/privacy-policy/download`), or the same token
+ *    in executable code is still a hard failure.
+ *
+ * Widening this list is a security decision, not a copy tweak.
+ */
+const APPROVED_DOCUMENTATION_REFERENCES: ReadonlyArray<{
+  token: string
+  reference: string
+  files: readonly string[]
+}> = [
+  {
+    token: 'directioner.com',
+    reference: 'https://directioner.com/privacy-policy',
+    files: ['README.md'],
+  },
+]
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Remove approved documentation references from `text` so the vendor-token
+ * scan ignores them. Everything else — including the same token in any other
+ * form — is left intact and still detected.
+ */
+export function stripApprovedDocumentationReferences(
+  text: string,
+  fileName: string,
+): string {
+  const base = fileName.split('/').pop() ?? fileName
+  let out = text
+  for (const entry of APPROVED_DOCUMENTATION_REFERENCES) {
+    if (!entry.files.includes(base)) continue
+    // A complete URL: not immediately followed by a character that would
+    // continue it into a broader path/query (e.g. `…/privacy-policy/download`).
+    // Markdown punctuation that merely delimits the link — `)`, `(`, `,`, `.` —
+    // is not part of the URL and must not block the match.
+    const pattern = new RegExp(
+      `${escapeRegExp(entry.reference)}(?![A-Za-z0-9/_~?#=&%.-])`,
+      'g',
+    )
+    out = out.replace(pattern, '')
+  }
+  return out
+}
+
+/**
  * The same tokens inside the compiled *binary*. The BYOK binary makes no such
  * calls in DIRECTIONER_MODE (analytics is a no-op and auth is skipped), but
  * legacy strings are still embedded — chiefly the inert `posthog-node` bundle
@@ -289,9 +351,12 @@ function validateLegacyCoupling(packageDir: string): CheckResult[] {
       for (const fileName of textFiles) {
         const text = readText(join(packageDir, fileName))
         if (text === null) continue
-        const hit = findToken(text, FORBIDDEN_PACKAGE_TOKENS)
+        // Approved documentation references (e.g. the canonical privacy-policy
+        // link the data-use disclosure must carry) are not vendor egress.
+        const scanned = stripApprovedDocumentationReferences(text, fileName)
+        const hit = findToken(scanned, FORBIDDEN_PACKAGE_TOKENS)
         if (hit) {
-          return `${fileName} contains "${hit.token}" at ${redactContext(text, hit.index)}`
+          return `${fileName} contains "${hit.token}" at ${redactContext(scanned, hit.index)}`
         }
       }
       return null

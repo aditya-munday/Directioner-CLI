@@ -249,6 +249,25 @@ describe('aria contract: speech shapes and stream rules', () => {
     expect(decoded.ok).toBe(false)
   })
 
+  test('malformed base64 is refused rather than throwing', () => {
+    // `atob` throws on malformed base64; the parser must surface that as a
+    // CheckResult refusal so callers can handle it like any other bad payload.
+    const decoded = decodeAriaPcm({
+      sample_rate: 16000,
+      channels: 1,
+      samples_le_base64: 'not base64!!!',
+    })
+    expect(decoded.ok).toBe(false)
+    if (!decoded.ok) expect(decoded.reason).toContain('base64')
+  })
+
+  test('an empty audio payload decodes to no samples (terminal TTS frame)', () => {
+    // Empty PCM is legal on a synthesis terminal frame.
+    const decoded = decodeAriaPcm({ sample_rate: 16000, channels: 1, samples_le_base64: '' })
+    expect(decoded.ok).toBe(true)
+    if (decoded.ok) expect(decoded.value.length).toBe(0)
+  })
+
   test('recognition stream uses replace semantics up to the final event', () => {
     const events = [
       { contract_version: 1, is_final: false, text: 'hello' },
@@ -317,6 +336,20 @@ describe('aria contract: speech shapes and stream rules', () => {
       },
     ]
     expect(reconstructAriaTtsStream(events).ok).toBe(false)
+  })
+
+  test('a synthesis chunk with malformed base64 is refused, not thrown', () => {
+    const events = [
+      {
+        contract_version: 1,
+        sequence: 0,
+        is_final: false,
+        audio: { sample_rate: 16000, channels: 1, samples_le_base64: 'not base64!!!' },
+      },
+    ]
+    const result = reconstructAriaTtsStream(events)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toContain('base64')
   })
 
   test('the empty terminal frame terminates the stream and contributes no samples', () => {

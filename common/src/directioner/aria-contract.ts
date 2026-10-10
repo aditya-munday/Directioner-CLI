@@ -671,7 +671,16 @@ export function parseAriaTtsResponse(
 
 /** Decode an Aria PCM payload into interleaved i16 samples (little-endian). */
 export function decodeAriaPcm(payload: AriaAudioPayload): CheckResult<Int16Array> {
-  const binary = atob(payload.samples_le_base64)
+  // `atob` throws `InvalidCharacterError` on malformed base64 (unlike Node's
+  // lenient `Buffer.from`, which silently drops undecodable characters). The
+  // function contract is a `CheckResult`, so a throw must be converted into a
+  // refusal rather than escaping to the caller.
+  let binary: string
+  try {
+    binary = atob(payload.samples_le_base64)
+  } catch {
+    return { ok: false, reason: 'audio payload is not valid base64' }
+  }
   if (binary.length % 2 !== 0) {
     return { ok: false, reason: 'audio payload has an odd byte count for i16 PCM' }
   }

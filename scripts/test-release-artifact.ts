@@ -166,8 +166,8 @@ try {
   const update = runGuarded(['--check-update'])
   check('--check-update exits 0', update.status === 0, `exit ${update.status}`)
   check(
-    '--check-update points at npm, not an update endpoint',
-    /npm install -g directioner/.test(update.stdout),
+    '--check-update points at the Directioner-OS image, not npm or an update endpoint',
+    /Directioner-OS/.test(update.stdout) && !/npm install -g/.test(update.stdout),
   )
   check('--check-update made no network attempt', update.attempts === '', update.attempts)
 

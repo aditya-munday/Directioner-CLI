@@ -41,13 +41,17 @@ export interface SdkAgentRunnerConfig {
 
 /**
  * A content-free progress note from a run snapshot: how many messages the agent
- * has accumulated, i.e. roughly how many steps it has taken. Never the message
- * text, a tool result, or a prompt — those stay in the run's local state.
+ * has accumulated, i.e. roughly how many steps it has taken, and a completion
+ * fraction when the run is bounded by a step ceiling. Never the message text, a
+ * tool result, or a prompt - those stay in the run's local state.
  */
-export function progressFromSnapshot(runState: RunState): AgentProgress {
+export function progressFromSnapshot(runState: RunState, maxSteps?: number): AgentProgress {
   const history = runState.sessionState?.mainAgentState?.messageHistory
   if (!Array.isArray(history)) return {}
-  return { step: history.length }
+  const step = history.length
+  if (maxSteps === undefined || !(maxSteps > 0)) return { step }
+  const fraction = Math.min(1, Math.max(0, step / maxSteps))
+  return { step, fraction }
 }
 
 /**
@@ -86,7 +90,7 @@ export function createSdkAgentRunner(
       // Each checkpoint snapshot becomes one engineer.progress event, so a
       // supervising client sees the run advance without any message content.
       onStateSnapshot: (snapshot) => {
-        void reportProgress(progressFromSnapshot(snapshot))
+        void reportProgress(progressFromSnapshot(snapshot, config.maxAgentSteps))
       },
       ...(config.maxAgentSteps !== undefined
         ? { maxAgentSteps: config.maxAgentSteps }

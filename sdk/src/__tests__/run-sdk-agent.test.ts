@@ -32,6 +32,18 @@ describe('progressFromSnapshot', () => {
     const bare = { output: { type: 'text', content: 'x' }, traceSessionId: 't' } as unknown as RunState
     expect(progressFromSnapshot(bare)).toEqual({})
   })
+
+  it('reports a bounded completion fraction when a step ceiling is known', () => {
+    expect(progressFromSnapshot(snapshot(5), 20)).toEqual({ step: 5, fraction: 0.25 })
+  })
+
+  it('clamps the fraction to one when the run exceeds its ceiling', () => {
+    expect(progressFromSnapshot(snapshot(30), 20)).toEqual({ step: 30, fraction: 1 })
+  })
+
+  it('omits the fraction for a non-positive ceiling rather than dividing by it', () => {
+    expect(progressFromSnapshot(snapshot(3), 0)).toEqual({ step: 3 })
+  })
 })
 
 describe('toAgentRunResult', () => {
@@ -73,5 +85,33 @@ describe('createSdkAgentRunner', () => {
 
     expect(reported).toEqual([{ step: 1 }, { step: 4 }])
     expect(result).toEqual({ outcome: 'succeeded' })
+  })
+
+  it('carries the step ceiling into the reported progress fraction', async () => {
+    const reported: unknown[] = []
+    const runner = createSdkAgentRunner({
+      cwd: '/repo',
+      apiKey: 'k',
+      fingerprintId: 'fp',
+      maxAgentSteps: 8,
+      runFn: (async (options: { onStateSnapshot?: (s: RunState) => void }) => {
+        options.onStateSnapshot?.(snapshot(2))
+        options.onStateSnapshot?.(snapshot(6))
+        return { output: { type: 'text', content: 'ok' }, traceSessionId: 't' } as unknown as RunState
+      }) as unknown as typeof import('../run').run,
+    })
+
+    await runner({
+      prompt: 'do it',
+      signal: new AbortController().signal,
+      reportProgress: async (p) => {
+        reported.push(p)
+      },
+    })
+
+    expect(reported).toEqual([
+      { step: 2, fraction: 0.25 },
+      { step: 6, fraction: 0.75 },
+    ])
   })
 })

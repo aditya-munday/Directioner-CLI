@@ -297,6 +297,11 @@ agent is injected as an `AgentRunner`; the production runner is
 the host proves the effect; a cancellation is confirmed only after the agent
 stops. See `docs/task-execution-boundary.md`.
 
+`engineer.progress` events are content-free metadata: a short note, a step
+count, and a completion `fraction` in `[0, 1]`. `progressFromSnapshot` derives
+the fraction from the run's `maxAgentSteps` ceiling (clamped) and omits it when
+no positive ceiling is known — never a raw message, tool result, or prompt.
+
 Test/typecheck: `bun install` then `bun --cwd common test` and
 `bun --cwd common run typecheck`. The directioner tests
 (`common/src/directioner/__tests__/*`) use a real `fetch`/in-memory double, not

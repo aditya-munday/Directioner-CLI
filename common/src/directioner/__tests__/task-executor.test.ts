@@ -302,3 +302,82 @@ describe('task executor: cancellation is not a result', () => {
     expect(outcome.status).toBe('client_error')
   })
 })
+
+describe('task executor: engineer progress', () => {
+  it('records engineer.progress events the runner reports', async () => {
+    const state = freshState()
+    const executor = createTaskExecutor({
+      client: fakeClient(state),
+      runAgent: async ({ reportProgress }) => {
+        await reportProgress({ note: 'planning', fraction: 0.25 })
+        await reportProgress({ note: 'running tests', fraction: 0.75 })
+        return { outcome: 'succeeded' }
+      },
+      ...FAST,
+    })
+
+    const outcome = await executor.executeTask('task-1')
+    expect(outcome.status).toBe('completed')
+
+    const progress = state.events.filter((e) => e.type === 'engineer.progress')
+    expect(progress).toHaveLength(2)
+    expect(progress[0]?.payload).toMatchObject({ note: 'planning', fraction: 0.25 })
+    // Each progress event carries a distinct idempotency key.
+    expect(progress[0]?.idempotencyKey).not.toBe(progress[1]?.idempotencyKey)
+  })
+
+  it('bounds the note and clamps the fraction so the payload stays metadata', async () => {
+    const state = freshState()
+    const executor = createTaskExecutor({
+      client: fakeClient(state),
+      runAgent: async ({ reportProgress }) => {
+        await reportProgress({ note: 'x'.repeat(2_000), fraction: 9 })
+        return { outcome: 'succeeded' }
+      },
+      ...FAST,
+    })
+
+    await executor.executeTask('task-1')
+    const progress = state.events.find((e) => e.type === 'engineer.progress')
+    expect((progress?.payload?.note as string).length).toBe(500)
+    expect(progress?.payload?.fraction).toBe(1)
+  })
+
+  it('never fails the run when a progress report is rejected', async () => {
+    const state = freshState()
+    const client = fakeClient(state)
+    client.appendEvent = async (_taskId, input) => {
+      if (input.type === 'engineer.progress') {
+        return {
+          status: 'failed',
+          error: { code: 'TASK_STATE_INVALID', message: 'no', retryable: false },
+        }
+      }
+      state.events.push(input)
+      return ok({
+        event: {
+          eventId: 'evt',
+          taskId: 'task-1',
+          sequence: state.events.length,
+          type: 'task.started',
+          timestamp: '2026-10-10T00:00:01.000Z',
+          correlationId: '',
+          idempotencyKey: input.idempotencyKey,
+        },
+      })
+    }
+    const executor = createTaskExecutor({
+      client,
+      runAgent: async ({ reportProgress }) => {
+        await reportProgress({ note: 'still working' })
+        return { outcome: 'succeeded', verification: 'confirmed' }
+      },
+      ...FAST,
+    })
+
+    const outcome = await executor.executeTask('task-1')
+    // Progress is an observation: a rejected report must not fail the task.
+    expect(outcome.status).toBe('completed')
+    expect(state.result?.verification).toBe('confirmed')
+  })
+})

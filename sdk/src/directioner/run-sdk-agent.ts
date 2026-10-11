@@ -14,6 +14,7 @@
 import type { RunState } from '../run-state'
 import type { RunOptions } from '../run'
 import type {
+  AgentProgress,
   AgentRunResult,
   AgentRunner,
 } from '@beyonders/common/directioner/task-executor'
@@ -31,6 +32,26 @@ export interface SdkAgentRunnerConfig {
   runOptions?: Partial<RunOptions>
   /** Upper bound on agent steps, so a runaway loop cannot hold a lease forever. */
   maxAgentSteps?: number
+  /**
+   * The SDK `run` function. Defaults to the real one, imported lazily; a test
+   * injects a stub so the adapter can be exercised without a model.
+   */
+  runFn?: typeof import('../run').run
+}
+
+/**
+ * A content-free progress note from a run snapshot: how many messages the agent
+ * has accumulated, i.e. roughly how many steps it has taken, and a completion
+ * fraction when the run is bounded by a step ceiling. Never the message text, a
+ * tool result, or a prompt - those stay in the run's local state.
+ */
+export function progressFromSnapshot(runState: RunState, maxSteps?: number): AgentProgress {
+  const history = runState.sessionState?.mainAgentState?.messageHistory
+  if (!Array.isArray(history)) return {}
+  const step = history.length
+  if (maxSteps === undefined || !(maxSteps > 0)) return { step }
+  const fraction = Math.min(1, Math.max(0, step / maxSteps))
+  return { step, fraction }
 }
 
 /**
@@ -57,15 +78,20 @@ export function toAgentRunResult(run: RunState): AgentRunResult {
 export function createSdkAgentRunner(
   config: SdkAgentRunnerConfig,
 ): AgentRunner {
-  return async ({ prompt, signal }) => {
-    const { run } = await import('../run')
-    const runState = await run({
+  return async ({ prompt, signal, reportProgress }) => {
+    const runFn = config.runFn ?? (await import('../run')).run
+    const runState = await runFn({
       agent: config.agent ?? 'base',
       prompt,
       cwd: config.cwd,
       apiKey: config.apiKey,
       fingerprintId: config.fingerprintId,
       signal,
+      // Each checkpoint snapshot becomes one engineer.progress event, so a
+      // supervising client sees the run advance without any message content.
+      onStateSnapshot: (snapshot) => {
+        void reportProgress(progressFromSnapshot(snapshot, config.maxAgentSteps))
+      },
       ...(config.maxAgentSteps !== undefined
         ? { maxAgentSteps: config.maxAgentSteps }
         : {}),

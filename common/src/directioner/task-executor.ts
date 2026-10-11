@@ -48,12 +48,31 @@ export interface AgentRunResult {
 }
 
 /**
+ * A progress note from the agent. Every field is optional and content-free: a
+ * note is a short status, a step is a count, and a fraction is a number — never
+ * raw output, a prompt, or a secret.
+ */
+export interface AgentProgress {
+  /** A short, already-redacted status, e.g. `"running tests"`. */
+  note?: string
+  /** How many agent steps have completed, when the host can count them. */
+  step?: number
+  /** Completion estimate in [0, 1], when the agent can make one. */
+  fraction?: number
+}
+
+/**
  * Runs the engineering agent for one prompt. Must honor `signal`: aborting it is
  * how a cancellation reaches the agent. A run that resolves has stopped.
+ *
+ * `reportProgress` records `engineer.progress` on the shared task so a
+ * supervising client (Aria) can show what the worker is doing. It is
+ * best-effort: a runner may ignore it, and a failed report never fails the run.
  */
 export type AgentRunner = (input: {
   prompt: string
   signal: AbortSignal
+  reportProgress: (progress: AgentProgress) => Promise<void>
 }) => Promise<AgentRunResult>
 
 export interface TaskExecutorConfig {
@@ -128,6 +147,39 @@ export function createTaskExecutor(config: TaskExecutorConfig): {
       const controller = new AbortController()
       let cancellationRequested = false
       let settled = false
+      let progressSequence = 0
+
+      // Record the agent's progress on the shared task so a supervising client
+      // can see it. Best-effort: a failure here never fails the run.
+      const reportProgress = async (progress: AgentProgress): Promise<void> => {
+        if (settled) return
+        const payload: Record<string, unknown> = {
+          sequence: progressSequence,
+        }
+        progressSequence += 1
+        if (progress.note !== undefined) {
+          // Bound the note so a runaway agent cannot blow the payload limit.
+          payload.note = progress.note.slice(0, 500)
+        }
+        if (progress.fraction !== undefined) {
+          payload.fraction = Math.min(1, Math.max(0, progress.fraction))
+        }
+        if (progress.step !== undefined) {
+          payload.step = Math.max(0, Math.trunc(progress.step))
+        }
+        try {
+          unwrap(
+            await config.client.appendEvent(taskId, {
+              type: 'engineer.progress',
+              idempotencyKey: `progress:${execution.executionId}:${payload.sequence}`,
+              payload,
+            }),
+          )
+        } catch {
+          // Progress is an observation, not a result: never fail the run for it.
+          log?.warn(`task ${taskId}: could not record agent progress`)
+        }
+      }
 
       // Renew the lease and watch for a cancellation request for the whole run.
       const poll = setInterval(() => {
@@ -157,6 +209,7 @@ export function createTaskExecutor(config: TaskExecutorConfig): {
         runResult = await config.runAgent({
           prompt,
           signal: controller.signal,
+          reportProgress,
         })
       } catch (error) {
         runResult = {

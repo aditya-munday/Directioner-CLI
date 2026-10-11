@@ -107,6 +107,13 @@ export type BackendTaskEventType =
   | 'approval.denied'
   | 'verification.recorded'
   | 'security.event'
+  | 'engineer.progress'
+  | 'engineer.question'
+  | 'engineer.plan_proposed'
+  | 'engineer.permission_requested'
+  | 'engineer.answer'
+  | 'engineer.plan_decision'
+  | 'engineer.permission_decision'
 
 export interface AppendEventInput {
   type: BackendTaskEventType

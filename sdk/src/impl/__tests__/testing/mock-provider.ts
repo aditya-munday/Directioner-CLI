@@ -24,6 +24,10 @@ export interface CapturedRequest {
   method: string
   headers: Record<string, string>
   body: Record<string, unknown>
+  /** The `redirect` mode the client asked the transport to use. */
+  redirect?: RequestRedirect
+  /** Whether the client attached an abort signal. */
+  hasSignal: boolean
 }
 
 export interface MockResult {
@@ -154,6 +158,8 @@ export function installMockProvider(
       method: init?.method ?? 'GET',
       headers,
       body,
+      redirect: init?.redirect,
+      hasSignal: init?.signal != null,
     }
     captured.push(record)
     return responder(record)

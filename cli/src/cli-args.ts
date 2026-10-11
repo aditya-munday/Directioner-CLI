@@ -24,6 +24,8 @@ export type ParsedArgs = {
   doctor: boolean
   /** Directioner only: with `doctor`, also send one minimal live request. */
   ping: boolean
+  /** Directioner only: print a read-only Linux system report and exit. */
+  systemDiagnostics: boolean
 }
 
 export function loadPackageVersion(): string {
@@ -88,6 +90,10 @@ export function parseArgs({
       .option(
         '--ping',
         'With --doctor, also send one minimal request to confirm the key and model',
+      )
+      .option(
+        '--system-diagnostics',
+        'Print a read-only Linux system report (kernel, modules, boot, devices) and exit',
       )
       .argument('[prompt...]', 'Initial prompt to send to the agent')
       .allowExcessArguments(true)
@@ -189,5 +195,8 @@ export function parseArgs({
     provider: isDirectioner ? options.provider : undefined,
     doctor: isDirectioner ? Boolean(options.doctor) : false,
     ping: isDirectioner ? Boolean(options.ping) : false,
+    systemDiagnostics: isDirectioner
+      ? Boolean(options.systemDiagnostics)
+      : false,
   }
 }

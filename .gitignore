@@ -62,6 +62,7 @@ cli/release-staging/http.js
 # artifacts are ignored.
 directioner/cli/release/.build/
 directioner/cli/release/dist/
+directioner/cli/release/component/
 xcuserdata/
 .claude/settings.local.json
 

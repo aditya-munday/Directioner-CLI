@@ -1,7 +1,7 @@
 name: Directioner Release Validation
 
-# Build, package, and validate a Directioner release, then upload the resulting
-# npm tarball as a downloadable artifact for review.
+# Build and validate the Directioner-CLI **OS component** — the prebuilt Linux
+# artifact Directioner-OS includes in its image — and upload it for review.
 #
 # This workflow is Directioner-owned and self-contained. It does NOT:
 #   - publish to npm, or modify any registry state;
@@ -9,14 +9,12 @@ name: Directioner Release Validation
 #   - dispatch BeyondersAI/directioner-private or any legacy release workflow;
 #   - require any provider API key, deploy secret, or vendor credential.
 #
-# It exists so the release process is boring and deterministic: the same build,
-# package, and gate run on every push, and the artifact is the exact thing the
-# gate and the clean-install test exercised.
+# The npm archive is built and validated too, but only as an internal,
+# development-only artifact (the launcher path remains useful for local testing).
+# It is never published and is not the customer distribution.
 #
-# Triggers are deliberately narrow. `workflow_dispatch` is the manual run; a PR
-# that touches the release path gets the same validation before merge. There is
-# no `push: main` trigger because this workflow produces an artifact, not a
-# release, and `main` is not modified by it.
+# Triggers are deliberately narrow. There is no `push: main` trigger because
+# this workflow produces an artifact, not a release, and `main` is not modified.
 
 on:
   workflow_dispatch:
@@ -29,10 +27,14 @@ on:
     paths:
       - 'directioner/**'
       - 'scripts/validate-release.ts'
+      - 'scripts/validate-component.ts'
+      - 'scripts/build-component.ts'
       - 'scripts/package-manifest.ts'
       - 'scripts/test-release-artifact.ts'
       - 'scripts/test-binary-offline.ts'
       - 'scripts/test-validator-failures.ts'
+      - 'scripts/test-component-failures.ts'
+      - 'scripts/test-component-runtime.ts'
       - 'scripts/net-guard.cjs'
       - '.github/workflows/directioner-release.yml'
 
@@ -51,7 +53,7 @@ env:
 
 jobs:
   release-validation:
-    name: Build, package, validate, test artifact
+    name: Build component, validate, test
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -61,7 +63,7 @@ jobs:
         with:
           bun-version-file: .bun-version
 
-      # Node is used by the launcher (the npm `bin`) and the artifact test.
+      # Node is used by the (internal) npm launcher and the artifact test.
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -78,18 +80,33 @@ jobs:
       - name: Build Directioner binary
         run: bun directioner/cli/build.ts "$DIRECTIONER_VERSION"
 
-      - name: Assemble npm package
+      # --- The customer artifact: the Directioner-OS component --------------
+      - name: Assemble OS component
+        run: bun scripts/build-component.ts "$DIRECTIONER_VERSION"
+
+      - name: Validate OS component (hard gate)
+        run: bun scripts/validate-component.ts --expected-version "$DIRECTIONER_VERSION"
+
+      - name: Component runtime test (staged out of the repo)
+        run: bun scripts/test-component-runtime.ts directioner/cli/release/component "$DIRECTIONER_VERSION"
+
+      - name: Component validator failure behavior
+        run: bun scripts/test-component-failures.ts
+
+      # --- Internal, development-only npm path (never published) ------------
+      - name: Assemble internal npm package (development-only)
         run: bun directioner/cli/package-release.ts "$DIRECTIONER_VERSION"
 
-      - name: Package-content manifest
+      - name: Package-content manifest (internal)
         run: bun scripts/package-manifest.ts "directioner/cli/release/dist/directioner-$DIRECTIONER_VERSION.tgz"
 
-      - name: Validate release package (hard gate)
+      - name: Validate internal npm package
         run: bun scripts/validate-release.ts --expected-version "$DIRECTIONER_VERSION"
 
       - name: Validator failure behavior
         run: bun scripts/test-validator-failures.ts
 
+      # --- Shared security and test gates ----------------------------------
       - name: Source egress guard
         run: bun scripts/check-no-vendor-egress.ts
 
@@ -99,16 +116,16 @@ jobs:
       - name: Directioner e2e tests
         run: bun test directioner/
 
-      - name: Clean-install artifact test
+      - name: Clean-install artifact test (internal npm path)
         run: bun scripts/test-release-artifact.ts "directioner/cli/release/dist/directioner-$DIRECTIONER_VERSION.tgz" "$DIRECTIONER_VERSION"
 
       - name: Binary offline check (network namespace)
-        run: bun scripts/test-binary-offline.ts directioner/cli/release/.build/directioner "$DIRECTIONER_VERSION"
+        run: bun scripts/test-binary-offline.ts directioner/cli/release/component/bin/directioner "$DIRECTIONER_VERSION"
 
-      - name: Upload release artifact
+      - name: Upload OS component artifact
         uses: actions/upload-artifact@v4
         with:
-          name: directioner-${{ env.DIRECTIONER_VERSION }}-npm-package
-          path: directioner/cli/release/dist/directioner-${{ env.DIRECTIONER_VERSION }}.tgz
+          name: directioner-cli-component-${{ env.DIRECTIONER_VERSION }}
+          path: directioner/cli/release/component/
           if-no-files-found: error
           retention-days: 14

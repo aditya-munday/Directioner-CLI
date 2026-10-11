@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url'
 import {
   detectBinaryFormat,
   scanForSecrets,
+  stripApprovedDocumentationReferences,
   validateRelease,
 } from '../../../../scripts/validate-release'
 
@@ -52,6 +53,10 @@ function validManifest(): Record<string, unknown> {
   return {
     name: 'directioner',
     version: '1.2.3',
+    license: 'Apache-2.0',
+    private: true,
+    os: ['linux'],
+    cpu: ['x64', 'arm64'],
     bin: { directioner: 'index.js' },
     files: ['index.js', 'launcher.js', 'README.md', 'directioner', 'tree-sitter.wasm'],
     repository: {
@@ -389,5 +394,112 @@ describe('release validator: version consistency', () => {
       expect(check?.ok).toBe(false)
       expect(check?.detail).toContain('4.5.6')
     })
+  })
+})
+
+describe('release validator: platform and license', () => {
+  test('accepts a Linux-only, private, Apache-2.0 package', () => {
+    withPackage(
+      () => {},
+      (dir) => expect(validateRelease(dir).ok).toBe(true),
+    )
+  })
+
+  test('rejects a non-Linux platform list', () => {
+    withPackage(
+      (dir) => {
+        const m = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+        m.os = ['linux', 'darwin', 'win32']
+        writeFileSync(join(dir, 'package.json'), JSON.stringify(m))
+      },
+      (dir) => expect(failingCheckNames(dir)).toContain('package: targets Linux only'),
+    )
+  })
+
+  test('rejects a package that is not marked private', () => {
+    withPackage(
+      (dir) => {
+        const m = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+        delete m.private
+        writeFileSync(join(dir, 'package.json'), JSON.stringify(m))
+      },
+      (dir) => expect(failingCheckNames(dir)).toContain('package: is not publishable'),
+    )
+  })
+
+  test('rejects a non-Apache-2.0 license', () => {
+    withPackage(
+      (dir) => {
+        const m = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+        m.license = 'MIT'
+        writeFileSync(join(dir, 'package.json'), JSON.stringify(m))
+      },
+      (dir) => expect(failingCheckNames(dir)).toContain('package: license declares Apache-2.0'),
+    )
+  })
+})
+
+describe('release validator: approved documentation references', () => {
+  const POLICY = 'https://directioner.com/privacy-policy'
+
+  test('allows the canonical privacy-policy URL in a package README', () => {
+    withPackage(
+      (dir) =>
+        writeFileSync(
+          join(dir, 'README.md'),
+          `# Directioner\n\nConfigure a provider and set your API key.\n\nSee the [Privacy Policy](${POLICY}) for complete details.\n`,
+        ),
+      (dir) =>
+        expect(failingCheckNames(dir)).not.toContain(
+          'legacy: package files carry no vendor references',
+        ),
+    )
+  })
+
+  test('still rejects the same token in executable code', () => {
+    withPackage(
+      (dir) =>
+        writeFileSync(
+          join(dir, 'launcher.js'),
+          `module.exports = { createLauncher() {} }\nconst HOST = 'https://directioner.com/privacy-policy'\n`,
+        ),
+      (dir) =>
+        expect(failingCheckNames(dir)).toContain(
+          'legacy: package files carry no vendor references',
+        ),
+    )
+  })
+
+  test('rejects a broadened URL that only prefixes the approved one', () => {
+    withPackage(
+      (dir) =>
+        writeFileSync(
+          join(dir, 'README.md'),
+          `# Directioner\n\nConfigure a provider and set your API key.\n\nDownload: ${POLICY}/download\n`,
+        ),
+      (dir) =>
+        expect(failingCheckNames(dir)).toContain(
+          'legacy: package files carry no vendor references',
+        ),
+    )
+  })
+
+  test('strip helper is exact, complete-URL, and file-scoped', () => {
+    const withUrl = `x ${POLICY} y`
+    expect(stripApprovedDocumentationReferences(withUrl, 'README.md')).not.toContain(
+      'directioner.com',
+    )
+    expect(
+      stripApprovedDocumentationReferences(`${POLICY}/download`, 'README.md'),
+    ).toContain('directioner.com')
+    expect(stripApprovedDocumentationReferences(withUrl, 'launcher.js')).toContain(
+      'directioner.com',
+    )
+    expect(
+      stripApprovedDocumentationReferences(
+        'https://directioner.com/api/releases',
+        'README.md',
+      ),
+    ).toContain('directioner.com')
   })
 })

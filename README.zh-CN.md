@@ -1,112 +1,145 @@
-# Directioner
+# Directioner CLI
+
+**本地终端 AI 编程智能体。** Directioner CLI 运行在你的机器上、在你的项目内部工作并修改你的代码——描述你想要的，它会检查仓库、进行修改、运行相关的检查，并如实报告实际发生的结果。
+
+它是 [Directioner](#directioner-生态系统) 生态系统中的本地智能体客户端。用户直接与它交互；它不需要语音助手、浏览器或托管服务即可运行。
 
 [English](./README.md) | 简体中文
 
-**面向编程、构建和研究的五款免费 AI 产品。** 无需订阅、积分或 API 密钥。
+## 当前状态
 
-[Directioner](https://directioner.com) 将专业化智能体和多种领先模型带到你的终端、桌面、浏览器和 GitHub 仓库中。内置模型由文字广告支持。
+本仓库当前发布的是**独立、自带密钥（BYOK）**构建。
 
-## 选择适合你的 Directioner
+| 能力 | 状态 |
+| --- | --- |
+| 修改代码、运行命令的本地终端智能体 | **AVAILABLE** |
+| 自带提供商配置（`heital`、`eternal`、`infernal`） | **AVAILABLE** |
+| `--doctor` 配置检查，无需强制登录 | **AVAILABLE** |
+| 独立构建、打包与发布校验 | **AVAILABLE** |
+| 提示注入、文件系统与终端加固 | **AVAILABLE**（有边界，见下文） |
+| Directioner 账户登录与设备注册 | **DESIGNED** —— 尚未实现 |
+| Directioner 后端与模型网关（用户不持有密钥） | **PLANNED** —— 后端尚不存在 |
+| 云端任务/历史记录与本地/云端同步 | **PLANNED** |
+| Aria 语音助手集成 | **PLANNED** —— 独立产品，并非必需中介 |
+| Directioner-OS 特权操作集成 | **DESIGNED** —— 独立权限主体 |
 
-| 产品                 | 功能                         | 开始使用                                                        |
-| -------------------- | ---------------------------- | --------------------------------------------------------------- |
-| **Directioner Desktop** | 在本地并行运行多个智能体     | [下载 macOS、Windows 或 Linux 版](https://directioner.com/desktop) |
-| **Directioner CLI**     | 从终端编程                   | [安装 CLI](https://directioner.com/cli)                            |
-| **Directioner Web**     | 构建和发布全栈应用           | [构建应用](https://directioner.com/web)                            |
-| **Directioner Cloud**   | 在任意 GitHub 仓库运行智能体 | [连接仓库](https://directioner.com/cloud)                          |
-| **Directioner Chat**    | 使用 AI 进行研究和思考       | [开始对话](https://directioner.com/chat)                           |
+除非某行的状态为 **AVAILABLE**，否则不要将其视为已实现。完整逐项审计见
+[`docs/directioner-documentation-audit.md`](./docs/directioner-documentation-audit.md)。
 
-## 快速开始
+## 快速开始（当前 BYOK 构建）
 
-在任意项目中从终端运行 Directioner：
+Directioner CLI 目前直接与你**自行**配置的模型提供商通信。没有强制登录，请求路径中也没有 Directioner 端点。
+
+1. 按 [`docs/INSTALLATION.md`](./docs/INSTALLATION.md) 安装（开发构建或内部发布产物——**不是**面向客户的 `npm install -g`）。
+2. 导出某个提供商的 API 密钥：
+
+   | 提供商 id | 模型提供商       | 建议的 API 密钥环境变量 |
+   | --------- | ---------------- | ----------------------- |
+   | `heital`  | Google Gemini    | `HEITAL_API_KEY`        |
+   | `eternal` | Anthropic Claude | `ETERNAL_API_KEY`       |
+   | `infernal`| Groq             | `INFERNAL_API_KEY`      |
+
+3. 写入 `~/.config/directioner/config.json`：
+
+   ```json
+   {
+     "version": 1,
+     "providers": [
+       { "id": "heital", "model": "gemini-3.8-flash", "apiKeyEnvVar": "HEITAL_API_KEY" }
+     ],
+     "active": "heital"
+   }
+   ```
+
+   密钥在请求时从环境读取，永不写入磁盘——配置只记录变量名。
+
+4. 校验后运行：
+
+   ```bash
+   directioner --doctor        # 配置、密钥是否存在、端点连通性
+   cd ~/my-project
+   directioner
+   ```
+
+完整预览配置见 [`directioner/README.md`](./directioner/README.md)。
+
+> `npm install -g directioner` 只出现在旧的内部笔记中。它是构建/校验细节，**不是**客户安装路径。客户安装方式是官方 Directioner 下载或安装程序，目前尚不存在。
+
+## Directioner 生态系统
+
+| 组件 | 角色 | 与本仓库的关系 |
+| --- | --- | --- |
+| **Beyonders** | 公司与总品牌。 | 发布方。 |
+| **Directioner CLI** | 本仓库——本地 AI 智能体。 | 本代码。 |
+| **Directioner Platform Backend** | 账户、模型网关、权益、任务/事件协调、云端同步。 | **尚未实现。** 客户端契约是 `common/src/directioner/platform-contract.ts`。 |
+| **Directioner Website** | 公司/客户平台：产品、账户、下载。 | 独立代码库，不在本仓库内。 |
+| **Aria** | 原生/本地语音助手。 | 独立产品。额外的交互面，**不是**通往 CLI 的必经路径。 |
+| **Directioner-OS** | AI 原生操作系统；特权 OS 操作的权限主体。 | 独立产品。保留特权权限；CLI 不获得 root 权限。 |
+| **AI-Engineer** | 生态中编码/系统智能体能力与权益。 | 同一智能体能力的呈现，并非第二个运行时。 |
+
+## 安全边界（及其局限）
+
+Directioner CLI 包含多层加固。每一层都是**有边界**的控制，而非绝对保证：
+
+- **提示注入边界**——仓库指令、`AGENTS.md`、知识文件、MCP 工具描述与结果、工具元数据都被围栏化并视为不可信内容。文本**永远不是**权限：声称“用户已批准此操作”的字符串不能替代真实的批准记录。见 [`docs/PROMPT-INJECTION-BOUNDARIES.md`](./docs/PROMPT-INJECTION-BOUNDARIES.md)。
+- **文件系统与终端约束**——读/写被限制在项目根目录内，处理了符号链接/硬链接与 TOCTOU 情形，终端工作目录与环境会被过滤，形似凭据的变量会被剥离。这是**逻辑**约束，**不是**操作系统沙箱。见 [`docs/FILESYSTEM-AND-TERMINAL-SECURITY.md`](./docs/FILESYSTEM-AND-TERMINAL-SECURITY.md)。
+
+我们不声称对提示注入免疫、不声称完整的操作系统沙箱，也不声称无限制的系统/驱动修复。
+
+## 开发
+
+Directioner CLI 是使用 Bun 构建的 TypeScript monorepo。
 
 ```bash
-npm install -g directioner
-cd ~/my-project
-directioner
+git clone https://github.com/aditya-munday/Directioner-CLI.git
+cd Directioner-CLI
+bun install
 ```
 
-然后描述你想完成的任务。Directioner 会找到相关文件、进行修改，并运行适合该项目的检查。
+常用检查：
 
-## 模型
+```bash
+bun run build:sdk                 # 构建 SDK
+bun run build:directioner         # 构建 Directioner 二进制
+bun test directioner/             # 针对已构建二进制的端到端测试
+bun scripts/validate-release.ts --expected-version 0.1.0
+```
 
-Directioner 提供经过筛选的模型目录。常规模型选择器目前包括：
+见 [`CONTRIBUTING.md`](./CONTRIBUTING.md)、[`docs/testing.md`](./docs/testing.md)
+与 [`docs/directioner-release.md`](./docs/directioner-release.md)。
 
-| 模型                        | 访问范围       | 适用场景                                         |
-| --------------------------- | -------------- | ------------------------------------------------ |
-| **GLM 5.3 Flash**           | 完整和受限访问 | 所有模式下的默认模型；推理最深入，不消耗会话         |
-| **DeepSeek V4.1 Flash** | 完整和受限访问 | 快速编程和工具调用，不消耗会话                   |
-| **GPT-6 Luna**              | 完整访问       | 综合能力强，原生支持图像；运行于 OpenAI flex 容量 |
-| **MiMo 2.6 Flash**          | 完整和受限访问 | 均衡性能并支持图像                               |
-| **MiMo 2.6 Pro**            | 完整访问       | 小米更强的推理模型，支持图像 |
-| **Solar Mini 4**            | 完整和受限访问 | Upstage 的快速轻量模型；52.4 万上下文，仅支持文本 |
-| **Solar Pro 4**             | 完整和受限访问 | Upstage 更大、更强的模型；52.4 万上下文，仅支持文本 |
-| **Space Bunny Alpha**       | 完整访问       | 测试版。来自匿名提供方的隐身模型，提供方会保留提示词；100 万上下文，支持图像 |
-| **Gemini 3.8 Flash**        | 付费套餐       | 100 万上下文，唯一支持音频、视频和 PDF 输入的模型 |
-| **Muse Spark 1.2**          | 完整访问       | Meta 的智能体编码模型；100 万上下文。有速率限制且所有用户共享，繁忙时排队，随后改由 DeepSeek V4 Flash 作答，不会让你一直等 |
+## 文档
 
-大多数模型使用你的常规每日会话，而不再各自设限。GLM 5.3 Flash、DeepSeek V4.1 Flash、MiMo 2.6 Flash、Solar Mini 4 和 Solar Pro 4 在完整访问下保持无限使用，完全不消耗会话。模型仍可能由量化（Q8_0）版本提供服务。
+- [产品概览](./docs/PRODUCT-OVERVIEW.md)
+- [架构](./docs/ARCHITECTURE.md)
+- [安装](./docs/INSTALLATION.md)
+- [配置](./docs/CONFIGURATION.md)
+- [安全模型](./docs/SECURITY-MODEL.md)
+- [提示注入边界](./docs/PROMPT-INJECTION-BOUNDARIES.md)
+- [文件系统与终端安全](./docs/FILESYSTEM-AND-TERMINAL-SECURITY.md)
+- [发布与分发](./docs/RELEASE-AND-DISTRIBUTION.md)
+- [托管架构（规划中）](./docs/HOSTED-ARCHITECTURE.md)
+- [任务/会话/事件模型](./docs/TASK-SESSION-EVENT-MODEL.md)
+- [智能体质量评估](./docs/AGENT-QUALITY-EVALUATION.md)
+- [性能](./docs/PERFORMANCE.md)
+- [实现状态](./docs/IMPLEMENTATION-STATUS.md)
+- [已知限制](./docs/KNOWN-LIMITATIONS.md)
+- [文档审计](./docs/directioner-documentation-audit.md)
+- [生产就绪待办](./docs/directioner-production-readiness.md)
 
-DeepSeek V4 Pro 已从模型目录中下线，由 GLM 5.3 Flash 接替其深度推理的位置。
+## 故障排查
 
-常规模型选择器之外：
+Windows 目前不受支持，详见 [`docs/KNOWN-LIMITATIONS.md`](./docs/KNOWN-LIMITATIONS.md)；
+当前缺口见 [`docs/KNOWN-LIMITATIONS.md`](./docs/KNOWN-LIMITATIONS.md)。
 
-- **推荐好友与悬赏任务**可在每日免费额度之外赚取额外会话。
-- **Gemini 3.1 Flash Lite** 用于查找文件和研究等专业任务，不会出现在主模型选择器中。
-
-可用模型和限制取决于你的访问级别、所用产品和当前容量。Directioner Desktop 还可以通过你现有的提供商账户运行本地安装的 Claude Code 和 Codex 智能体；这些连接的模型不属于 Directioner 的内置模型目录。
-
-## Directioner 的工作原理
-
-Directioner 使用专业化智能体，而不是把所有任务都交给同一个模型和同一条提示词。根据任务需要，智能体会收集上下文、制定计划、编辑或研究、运行工具并审查结果。
-
-- **代码库上下文** —— 文件查找智能体会在编辑前定位项目中的相关部分。
-- **实现与审查** —— 智能体可以拆分工作、修改文件、运行命令并检查结果。
-- **研究与浏览器操作** —— 智能体可以查阅文档，并在真实浏览器中测试应用。
-- **本地并行工作** —— Desktop 会将并发智能体隔离在各自的工作区中。
-- **托管环境** —— Web 和 Cloud 提供沙箱、预览、终端和部署工作流。
-
-## 免费访问
-
-Directioner 在所有国家和地区均可使用。受支持的地区提供完整访问；其他地区以及使用 VPN 的用户获得受限访问，包括 DeepSeek V4.1 Flash、GLM 5.3 Flash、MiMo 2.6 Flash、Solar Mini 4 和 Solar Pro 4。使用 Freebucks 的账户按显示的模型价格和余额计费。在旧版会话系统中，受限访问每天提供六个一小时会话，最多可赚取七个；GLM 则使用赚取的奖励会话。
-
-内置模型由文字广告支持。开始前，Directioner 会显示适用的会话限制以及模型特定的数据使用提示。
-
-## 数据使用与隐私
+## 数据使用
 
 **我的数据会用于训练 AI 吗？** 只有当模型或功能明确说明数据可能用于 AI 训练时才会。届时，Directioner 或模型提供商可能保留提交内容，用于开发、训练、测试、评估、微调和改进 AI 模型或产品。
 
-**我的数据会如何使用和存储？** 我们会使用提示词、消息、代码、文件和仓库数据来提供服务。我们可能会分析提示词和消息（包括粘贴的内容），通过 Directioner 系统及代表我们行事的服务提供商来个性化广告。单独上传的文件和已连接的仓库不会提供给广告服务商。在法律要求的地区，我们提供广告选择并遵循公认的退出信号；在其他地区，此类处理可能是使用免费服务的必要条件。留存期限与完整详情请参阅隐私政策。
+**我的数据会如何使用和存储？** 我们使用提示词、消息、智能体轨迹、代码、文件和仓库数据来提供 Directioner。我们不会将单独上传的文件或已连接的仓库提供给第三方。受限合作伙伴可能评估已连接的 Cloud 仓库，但不能另作他用、广泛共享或用于训练。留存期限、资格与数据选择请参阅隐私政策。
 
 完整详情请参阅[隐私政策](https://directioner.com/privacy-policy)。
 
-## 参与贡献
+## 许可证
 
-Directioner 是一个使用 Bun 构建的 TypeScript monorepo。欢迎为产品、智能体、工具、文档和底层运行时贡献代码。
-
-```bash
-git clone https://github.com/BeyondersAI/directioner.git
-cd directioner
-bun install
-bun up
-```
-
-单独启动 CLI：
-
-```bash
-bun start-cli
-```
-
-环境配置及提交拉取请求前应运行的检查，请参阅[贡献指南](./CONTRIBUTING.md)、[开发指南](./docs/development.md)和[测试指南](./docs/testing.md)。
-
-## 基于 Beyonders 构建
-
-Directioner 基于开放的多智能体框架 [Beyonders](https://beyonders.com) 构建，其编排、工具和 SDK 均由 Beyonders 提供。若要创建自定义智能体或将其嵌入其他应用，请参阅 [Beyonders 文档](https://beyonders.com/docs)和 [`@beyonders/sdk`](https://www.npmjs.com/package/@beyonders/sdk)。
-
-## 链接
-
-- [官网](https://directioner.com)
-- [GitHub](https://github.com/BeyondersAI/directioner)
-- [Discord](https://discord.gg/yXG3w7wxfs)
-- [隐私政策](https://directioner.com/privacy-policy)
-- [许可证](./LICENSE)
+Apache License 2.0——见 [`LICENSE`](./LICENSE) 与 [`NOTICE`](./NOTICE)。本产品是基于 Codebuff 的修改分发；[`NOTICE`](./NOTICE) 中的上游署名按许可证要求予以保留。

@@ -1,28 +1,29 @@
 # Directioner
 
-**The terminal coding agent from Beyonders.**
+**The terminal coding agent for Directioner-OS.**
 
-> **Development/testing preview.** This package is the developer preview. It is
-> not the production customer onboarding path. Production Directioner is a
-> locally installed application that signs in to a Directioner account and runs
-> against Directioner-owned model services — you do not configure a provider key.
-> That backend is still being built. This preview exists for local development
-> and engineering tests, and it runs directly against a model provider you
-> configure yourself.
+> **Internal development preview.** This npm package is an internal, development
+> artifact used to exercise the launcher path and its tests. It is **not** the
+> customer distribution and is never published. The customer artifact is the
+> prebuilt Linux **OS component** assembled by `scripts/build-component.ts` and
+> included in the Directioner-OS image; the OS install provides `directioner`
+> already installed.
+
+Directioner-CLI is a built-in component of Directioner-OS. Open a terminal and
+run `directioner` directly — no separate installer, no account, and no
+provider key are required for the shipped product. The eventual production
+architecture routes model access through Directioner-owned services; the
+present BYOK configuration below is a development/testing path only.
 
 An AI coding agent that runs in your terminal — describe what you want, and
 Directioner edits your code.
 
-## Install (preview)
+## Platform
 
-```bash
-npm install -g directioner
-```
+Directioner-CLI targets **Linux** (Directioner-OS). The component build produces
+a Linux ELF executable; there is no Windows or macOS customer build.
 
-The package ships the compiled binary for your platform. Nothing is downloaded
-at install time or on first run.
-
-## Configure (preview)
+## Configure (development / BYOK)
 
 Directioner talks directly to a model provider you name. Export the API key for
 the provider you want, then write `~/.config/directioner/config.json`:
@@ -60,20 +61,27 @@ directioner
 
 ## Updates
 
-This package does not check for updates automatically and has no update
-endpoint. To update, reinstall:
+Directioner-CLI does not check for updates automatically and has no update
+endpoint. Updates are delivered by **Directioner-OS**: installing a newer OS
+image provides the updated component. `directioner --check-update` prints the
+same guidance.
 
-```bash
-npm install -g directioner
-```
+## Platform note
 
-`directioner --check-update` prints the same guidance.
+Directioner-CLI ships a **Linux** (Directioner-OS) ELF executable. There is no
+Windows or macOS customer build.
 
-## Older Intel Macs (without AVX2)
+## Data use
 
-If the standard Intel binary exits with an illegal-instruction error, install
-the `darwin-x64-baseline` build instead and keep the extracted `directioner`
-binary and `tree-sitter.wasm` together.
+<!-- BEGIN GENERATED DIRECTIONER DATA USE -->
+
+**Is my data used to train AI?** Only when a model or feature says data may be used for AI training. Directioner or the provider may then keep submissions to develop, train, test, evaluate, fine-tune, and improve AI models or products.
+
+**How is my data used and stored?** We use prompts, messages, agent traces, code, files, and repository data to provide Directioner. We do not give separately uploaded files or connected repositories to third parties. Restricted partners may evaluate connected Cloud repositories, but cannot otherwise use, broadly share, or train on them. See the Privacy Policy for retention, eligibility, and data choices.
+
+See the [Privacy Policy](https://directioner.com/privacy-policy) for complete details.
+
+<!-- END GENERATED DIRECTIONER DATA USE -->
 
 ## Links
 

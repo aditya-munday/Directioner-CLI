@@ -4,10 +4,10 @@
  * Directioner npm launcher.
  *
  * Directioner is BYOK-first and standalone: this launcher ships the compiled
- * binary inside the npm package and never contacts a network origin. It copies
+ * binary inside the component and never contacts a network origin. It copies
  * the packaged binary (and its `tree-sitter.wasm` sibling) into a per-user cache
  * and execs it. There is no download, no update check, no telemetry, and no
- * vendor endpoint — reinstall with `npm install -g directioner` to update.
+ * vendor endpoint. Updates arrive through the Directioner-OS image, not npm.
  *
  * This file is standalone: it is copied verbatim into the published package and
  * must not `require()` anything outside Node's standard library. Everything it
@@ -39,12 +39,12 @@ const SAFE_TERMINAL_RESET_SEQUENCES =
   '\x1b[>4;0m' + // Reset modifyOtherKeys
   '\x1b[?25h' // Show cursor
 
-/** The only platforms the release packages. Kept in sync with package.json. */
-const SUPPORTED_PLATFORMS = new Set(['linux', 'darwin', 'win32'])
+/** The only platform the release packages: Linux (Directioner-OS). */
+const SUPPORTED_PLATFORMS = new Set(['linux'])
 const SUPPORTED_ARCHES = new Set(['x64', 'arm64'])
 
-function binaryFileName(platform) {
-  return platform === 'win32' ? 'directioner.exe' : 'directioner'
+function binaryFileName(_platform) {
+  return 'directioner'
 }
 
 /**
@@ -149,7 +149,7 @@ function createLauncher(config = {}) {
     if (!fs.existsSync(packagedBinaryPath)) {
       throw new Error(
         `the packaged binary is missing (${packagedBinaryPath}). ` +
-          `Reinstall with: npm install -g ${packageName}`,
+          `Reinstall the ${displayName} component from your Directioner-OS image.`,
       )
     }
 
@@ -184,8 +184,9 @@ function createLauncher(config = {}) {
     // `--version` / `--doctor`, so its absence warns rather than blocking a run.
     if (!fs.existsSync(path.join(cacheDir, 'tree-sitter.wasm'))) {
       process.stderr.write(
-        `${displayName}: tree-sitter.wasm is missing from the package; ` +
-          `code intelligence may be unavailable. Reinstall with: npm install -g ${packageName}\n`,
+        `${displayName}: tree-sitter.wasm is missing from the component; ` +
+          `code intelligence may be unavailable. Reinstall the component from ` +
+          `your Directioner-OS image.\n`,
       )
     }
 
@@ -235,8 +236,8 @@ function createLauncher(config = {}) {
   function printUpdateGuidance() {
     process.stdout.write(
       `${displayName} does not check for updates automatically and has no update\n` +
-        `endpoint. To update, reinstall from npm:\n\n` +
-        `  npm install -g ${packageName}\n`,
+        `endpoint. Updates are delivered by Directioner-OS: install the newer` +
+        `\nimage, which provides the updated component.\n`,
     )
   }
 

@@ -204,30 +204,67 @@ export function createTaskExecutor(config: TaskExecutorConfig): {
         }),
       )
 
-      let runResult: AgentRunResult
-      try {
-        runResult = await config.runAgent({
-          prompt,
-          signal: controller.signal,
-          reportProgress,
-        })
-      } catch (error) {
-        runResult = {
-          outcome: 'failed',
-          errorCode: 'AGENT_RUN_FAILED',
-          summary:
-            error instanceof Error ? error.message : 'The agent run failed.',
+      // Run the agent, normalizing a thrown run into a failed result so the
+      // outcome is always a value we can classify.
+      const runSettled: Promise<AgentRunResult> = (async () => {
+        try {
+          return await config.runAgent({
+            prompt,
+            signal: controller.signal,
+            reportProgress,
+          })
+        } catch (error) {
+          return {
+            outcome: 'failed',
+            errorCode: 'AGENT_RUN_FAILED',
+            summary:
+              error instanceof Error ? error.message : 'The agent run failed.',
+          } satisfies AgentRunResult
         }
-      } finally {
-        settled = true
-        clearInterval(poll)
-      }
+      })()
+      // Race the run against the cancellation abort. A run that returns is the
+      // observation that execution ended, so we confirm the stop. A run that
+      // ignores the abort is given `abortGraceMs` to stop; if it does not, the
+      // stop was NOT observed and we must not claim a cancellation.
+      const abortGate = new Promise<
+        { kind: 'cancelled' } | { kind: 'grace_expired' }
+      >((resolve) => {
+        const onAbort = (): void => {
+          const grace = setTimeout(
+            () => resolve({ kind: 'grace_expired' }),
+            abortGraceMs,
+          )
+          void runSettled.finally(() => {
+            clearTimeout(grace)
+            resolve({ kind: 'cancelled' })
+          })
+        }
+        if (controller.signal.aborted) onAbort()
+        else
+          controller.signal.addEventListener('abort', onAbort, { once: true })
+      })
 
-      if (cancellationRequested) {
-        return await confirmCancellation(taskId, execution)
-      }
+      const outcome = await Promise.race([
+        runSettled.then((result) => ({ kind: 'ran' as const, result })),
+        abortGate,
+      ])
 
-      return await recordOutcome(taskId, execution, runResult)
+      settled = true
+      clearInterval(poll)
+
+      // A cancellation request is not a result: if one arrived, the run ending
+      // is the observation that the agent stopped, and we confirm the stop — the
+      // agent's own "succeeded" never overrides the user's cancellation.
+      if (outcome.kind === 'grace_expired') {
+        // The agent did not stop within the grace period. Report that we could
+        // not stop it, and record the run as failed — never as cancelled, since
+        // a false "cancelled" lies about work that may still be running.
+        return await confirmCancellation(taskId, execution, false)
+      }
+      if (outcome.kind === 'cancelled' || cancellationRequested) {
+        return await confirmCancellation(taskId, execution, true)
+      }
+      return await recordOutcome(taskId, execution, outcome.result)
     } catch (error) {
       if (error instanceof ExecutorClientError) {
         return { status: 'client_error', taskId, error: error.service }
@@ -260,22 +297,32 @@ export function createTaskExecutor(config: TaskExecutorConfig): {
   }
 
   /**
-   * A cancellation was requested and the agent's run has settled. We confirm
-   * the stop: the run returning is the observation that execution ended. If the
-   * backend refuses the confirmation, the failure is surfaced rather than a
-   * false "cancelled".
+   * A cancellation was requested. `stopped` is our observation that the run
+   * ended. When it is true we confirm the stop (the backend refuses unless the
+   * request is on record, so a refusal is surfaced, not turned into a false
+   * "cancelled"). When it is false the agent did not stop within the grace
+   * period: we report the cancellation as failed and return `confirmed: false`,
+   * never claiming a stop we could not observe.
    */
   async function confirmCancellation(
     taskId: string,
     execution: TaskExecution,
+    stopped: boolean,
   ): Promise<ExecuteOutcome> {
     const confirmed = unwrap(
       await config.client.confirmCancellation(taskId, {
-        outcome: 'confirmed',
+        outcome: stopped ? 'confirmed' : 'failed',
         idempotencyKey: `cancel:${execution.executionId}`,
+        ...(stopped
+          ? {}
+          : { reason: 'the agent did not stop within the grace period' }),
       }),
     )
-    log?.info(`task ${taskId}: cancellation confirmed`)
+    log?.[stopped ? 'info' : 'warn'](
+      stopped
+        ? `task ${taskId}: cancellation confirmed`
+        : `task ${taskId}: cancellation could not be confirmed (agent still running)`,
+    )
     return {
       status: 'cancelled',
       taskId,

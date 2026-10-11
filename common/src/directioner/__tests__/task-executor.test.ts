@@ -13,6 +13,7 @@ import { describe, expect, it } from 'bun:test'
 import { createTaskExecutor, type AgentRunResult } from '../task-executor'
 import type {
   AppendEventInput,
+  ClaimRefusal,
   ClaimResult,
   ExecutionResultInput,
   SharedTaskClient,
@@ -45,6 +46,10 @@ interface FakeState {
   claimCount: number
   confirmations: number
   taskExists: boolean
+  /** Overrides the claim refusal reason (e.g. cancellation_requested). */
+  claimRefusal?: ClaimRefusal
+  /** Every cancellation confirmation the executor sent, in order. */
+  cancellationConfirms: { outcome: 'confirmed' | 'failed'; reason?: string }[]
 }
 
 function makeExecution(state: FakeState): TaskExecution {
@@ -91,7 +96,7 @@ function fakeClient(state: FakeState): SharedTaskClient {
         return ok({
           execution: makeExecution(state),
           claimed: false,
-          reason: 'lease_held',
+          reason: state.claimRefusal ?? 'lease_held',
         })
       return ok({ execution: makeExecution(state), claimed: true })
     },
@@ -121,8 +126,18 @@ function fakeClient(state: FakeState): SharedTaskClient {
       })
     },
     requestCancellation: async () => ok(makeExecution(state)),
-    confirmCancellation: async () => {
+    confirmCancellation: async (_taskId, input) => {
       state.confirmations += 1
+      state.cancellationConfirms.push({
+        outcome: input.outcome,
+        ...(input.reason !== undefined ? { reason: input.reason } : {}),
+      })
+      if (input.outcome === 'failed') {
+        return ok({
+          ...makeExecution(state),
+          cancellation: 'failed',
+        })
+      }
       state.cancellation = 'confirmed'
       return ok({
         ...makeExecution(state),
@@ -143,6 +158,7 @@ function freshState(overrides: Partial<FakeState> = {}): FakeState {
     claimCount: 0,
     confirmations: 0,
     taskExists: true,
+    cancellationConfirms: [],
     ...overrides,
   }
 }
@@ -300,6 +316,60 @@ describe('task executor: cancellation is not a result', () => {
 
     const outcome = await executor.executeTask('task-1')
     expect(outcome.status).toBe('client_error')
+  })
+
+  it('reports a failed cancellation, never a false stop, when the agent ignores the abort', async () => {
+    const state = freshState()
+    const executor = createTaskExecutor({
+      client: fakeClient(state),
+      // An agent that never honors the signal: the abort cannot stop it.
+      runAgent: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 500))
+        return { outcome: 'succeeded' }
+      },
+      ...FAST,
+    })
+    setTimeout(() => {
+      state.cancellation = 'requested'
+    }, 15)
+
+    const outcome = await executor.executeTask('task-1')
+    expect(outcome.status).toBe('cancelled')
+    if (outcome.status !== 'cancelled') return
+    // The stop was not observed: honest `confirmed: false`, a failed
+    // confirmation with a reason, and no recorded result.
+    expect(outcome.confirmed).toBe(false)
+    expect(state.cancellationConfirms).toEqual([
+      {
+        outcome: 'failed',
+        reason: 'the agent did not stop within the grace period',
+      },
+    ])
+    expect(state.result).toBeUndefined()
+  })
+
+  it('does not run the agent when the claim is refused for a pending cancellation', async () => {
+    const state = freshState({
+      claimed: false,
+      claimRefusal: 'cancellation_requested',
+    })
+    let ran = false
+    const executor = createTaskExecutor({
+      client: fakeClient(state),
+      runAgent: async () => {
+        ran = true
+        return { outcome: 'succeeded' }
+      },
+      ...FAST,
+    })
+    const outcome = await executor.executeTask('task-1')
+    expect(outcome).toEqual({
+      status: 'not_claimed',
+      taskId: 'task-1',
+      reason: 'cancellation_requested',
+    })
+    expect(ran).toBe(false)
+    expect(state.events).toEqual([])
   })
 })
 
